@@ -1,0 +1,36 @@
+[
+  {
+    "demande_utilisateur": "Tester que ParcoursWorkflowCommand appelle indexAction une fois et retourne SUCCESS.",
+    "contexte_pertinent": [
+      "Méthode 'execute' (ParcoursWorkflowCommand) — Route: (aucune) → Type de réponse: (commande Console)",
+      "protected function execute(InputInterface $input, OutputInterface $output): int",
+      "{",
+      "    $output->writeln(\"Début\\n\\n\");",
+      "    $result = $this->parcoursWorkflow->indexAction(",
+      "        true, $output,",
+      "        $input->getArgument('groupeDeCreanceRegroupee'),",
+      "        $input->getArgument('option')",
+      "    );",
+      "    $output->writeln(\"Fin \\n\\n\");",
+      "    return $result;",
+      "}"
+    ],
+    "test_ideal": "<?php\n\nnamespace App\\Tests\\Unit\\Command;\n\nuse App\\Command\\ParcoursWorkFlowCommand;\nuse App\\Service\\ParcoursWorkflow;\nuse PHPUnit\\Framework\\TestCase;\nuse Symfony\\Bundle\\FrameworkBundle\\Console\\Application;\nuse Symfony\\Bundle\\FrameworkBundle\\Test\\KernelTestCase;\nuse Symfony\\Component\\Console\\Command\\Command;\nuse Symfony\\Component\\Console\\Tester\\CommandTester;\n\nfinal class ParcoursWorkflowCommandTest extends KernelTestCase\n{\n    public function testExecuteAppelleIndexAction(): void\n    {\n        self::bootKernel();\n\n        $workflowMock = $this->createMock(ParcoursWorkflow::class);\n        $workflowMock->expects($this->once())\n            ->method('indexAction')\n            ->willReturn(Command::SUCCESS);\n\n        $command = new ParcoursWorkFlowCommand($workflowMock);\n\n        $application = new Application(self::$kernel);\n        $application->add($command);\n\n        $tester = new CommandTester($application->find('SUCREREG:ParcoursWF'));\n        $exitCode = $tester->execute([]);\n\n        $this->assertSame(Command::SUCCESS, $exitCode);\n        $this->assertStringContainsString('Début', $tester->getDisplay());\n        $this->assertStringContainsString('Fin', $tester->getDisplay());\n    }\n}"
+  },
+  {
+    "demande_utilisateur": "Tester que getAnvForm retourne une instance de FormView quand l'autorisation d'admission est accordée.",
+    "contexte_pertinent": [
+      "Méthode 'getAnvForm' (OngletService) — Route: (aucune) → Type de réponse: FormView|array|false",
+      "public function getAnvForm(CreanceRegroupee $creanceRegroupee, bool $isConsult, array $authorize): array|false|FormView",
+      "{",
+      "    $anv = $this->entityManager->getRepository(Anv::class)->findOneBy([...]);",
+      "    $isNew = null == $anv;",
+      "    if ($isConsult && $isNew) { return []; }",
+      "    if ($isConsult) { return $this->anvController->getAnvFormConsult($creanceRegroupee, $anv); }",
+      "    if (!$authorize['admission']) { return false; }",
+      "    return $this->anvController->getAnvFormNewOrUpdate($creanceRegroupee, $anv, $isNew);",
+      "}"
+    ],
+    "test_ideal": "<?php\n\nnamespace App\\Tests\\Unit\\Service;\n\nuse App\\Service\\OngletService;\nuse PHPUnit\\Framework\\TestCase;\nuse Symfony\\Component\\Form\\FormView;\n\nfinal class OngletServiceTest extends TestCase\n{\n    /** @dataProvider authorizeData */\n    public function testGetAnvFormRetourneFormViewQuandAdmissionAutorisee(array $authorize): void\n    {\n        $mockCreanceRegroupee = $this->createMock(\\App\\Entity\\CreanceRegroupee::class);\n        $mockAnvController    = $this->createMock(\\App\\Controller\\AnvController::class);\n        $mockEntityManager    = $this->createMock(\\Doctrine\\ORM\\EntityManagerInterface::class);\n\n        $mockAnvController->method('getAnvFormNewOrUpdate')\n            ->willReturn(new FormView());\n\n        $service = new OngletService($mockEntityManager, $mockAnvController);\n        $result  = $service->getAnvForm($mockCreanceRegroupee, false, $authorize);\n\n        $this->assertInstanceOf(FormView::class, $result);\n    }\n\n    public static function authorizeData(): array\n    {\n        return [\n            'admission accordée' => [['admission' => true]],\n        ];\n    }\n}"
+  }
+]

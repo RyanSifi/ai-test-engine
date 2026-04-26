@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 1. BASE DE DONNÉES VECTORIELLE (PostgreSQL + pgvector)
+  # ──────────────────────────────────────────────────────────────────────────
+  vector-db:
+    image: ankane/pgvector:latest
+    container_name: ai_memory_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       knowledge_base
+      POSTGRES_USER:     admin
+      POSTGRES_PASSWORD: secret_ai_password
+    volumes:
+      - ./data/pg_data:/var/lib/postgresql/data:Z
+    networks:
+      - internal_ai
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d knowledge_base"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+      start_period: 20s
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 2. API FASTAPI (moteur de test IA)
+  # ──────────────────────────────────────────────────────────────────────────
+  brain-api:
+    build: ./app
+    container_name: ai_brain_api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Monte le projet Symfony PARENT en lecture-écriture dans /workspace
+      # Structure attendue :
+      #   mon-projet-symfony/          <- dossier parent
+      #     ai-test-engine/            <- ce dossier (docker-compose.yml)
+      #     src/                       <- code Symfony
+      #     templates/                 <- templates Twig
+      #     tests/                     <- tests générés ici
+      - ..:/workspace:rw
+      # Hot-reload : modifier app/*.py sans reconstruire l'image
+      - ./app:/app
+    environment:
+      DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
+      OLLAMA_URL:               http://host.docker.internal:11434/api/generate
+      DEFAULT_EMBEDDING_MODEL:  paraphrase-multilingual-MiniLM-L12-v2
+      DEFAULT_LLM_MODEL:        qwen2.5-coder:7b
+      # CONTAINER_PROJECT_ROOT est /workspace par defaut (voir config.py)
+      # Surcharger ici seulement si le projet n'est pas le dossier parent direct :
+      # CONTAINER_PROJECT_ROOT: /workspace/mon-sous-dossier
+    depends_on:
+      vector-db:
+        condition: service_healthy   # Attend que PostgreSQL accepte les connexions
+    networks:
+      - internal_ai
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 60s   # Laisser le temps au modele d'embedding de se charger
+
+# ──────────────────────────────────────────────────────────────────────────
+# RESEAU
+# ──────────────────────────────────────────────────────────────────────────
+networks:
+  internal_ai:
+    driver: bridge
+    # Pour integrer dans un reseau Docker externe existant :
+    # external: true
+    # name: mon-reseau-existant

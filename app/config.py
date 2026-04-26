@@ -1,0 +1,26 @@
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file='.env', extra='ignore')
+
+    database_url: str
+    ollama_url: str = "http://host.docker.internal:11434/api/generate"
+    default_embedding_model: str = 'paraphrase-multilingual-MiniLM-L12-v2'
+    default_llm_model: str = 'qwen2.5-coder:7b'
+    container_project_root: str = "/workspace"
+    host_project_root: Optional[str] = None
+
+    # Contexte d'authentification injecté dans le prompt et le générateur déterministe.
+    # Adapter ces valeurs à votre projet dans le .env si nécessaire.
+    auth_firewall_name: str = "secured_area"         # nom du firewall Symfony (security.yaml)
+    auth_redirect_path: str = "/connect/web-sso"     # URL de login (WebSSO, /login, etc.)
+    auth_redirect_status: int = 307                  # code HTTP de la redirection non-auth
+    auth_test_roles: str = "ADMIN,CONSULT"           # rôles disponibles dans TestUserFactory
+    # Mapping rôle Symfony → clé TestUserFactory (ex: "ROLE_PARCOURS:PARCOURS,ROLE_ADMIN:ADMIN")
+    # Laisser vide si les rôles du chunk correspondent déjà aux clés de la factory.
+    auth_role_key_map: str = ""
+    auth_test_class: str = "App\\Tests\\Security\\TestUserFactory"
+    auth_sso_user_class: str = "Cnam\\WebSSOBundle\\User\\WebSSOUser"
+
+settings = Settings()
