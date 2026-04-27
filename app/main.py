@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 import requests
 import re
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import os
 import subprocess
@@ -97,40 +98,74 @@ app = FastAPI(
         "Microservice pour analyser un projet Symfony et générer automatiquement "
         "des tests fonctionnels (WebTestCase) et unitaires (PHPUnit) via RAG + LLM."
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "santé",        "description": "Health check & monitoring."},
+        {"name": "projets",      "description": "Stats et nettoyage des projets indexés."},
+        {"name": "indexation",   "description": "Apprentissage RAG depuis le code Symfony."},
+        {"name": "génération",   "description": "Génération de tests fonctionnels et unitaires."},
+        {"name": "admin",        "description": "Opérations destructrices (reset schema)."},
+    ],
 )
+
+# CORS — activé seulement si configuré dans le .env
+_cors_origins = [o.strip() for o in (settings.cors_origins or "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
 
 
 # ---------------------------------------------------------------------------
 # MODÈLES PYDANTIC
 # ---------------------------------------------------------------------------
 
+# Contraintes communes pour bloquer les inputs farfelus avant qu'ils n'atteignent
+# les colonnes VARCHAR(100) de la DB ou l'écriture de fichiers.
+_PROJECT_ID_PATTERN = r"^[a-zA-Z0-9_.-]+$"
+
+
 class LearnFromCodeRequest(BaseModel):
-    project_id: str
-    model_name: Optional[str] = settings.default_embedding_model
+    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
+    model_name: Optional[str] = Field(default=None, max_length=200)
     model_config = {"protected_namespaces": ()}
+
+    def model_post_init(self, __ctx) -> None:
+        if not self.model_name:
+            self.model_name = settings.default_embedding_model
 
 
 class GenerateTestRequest(BaseModel):
-    project_id: str
-    description: str
-    test_name: Optional[str] = None
-    class_name: Optional[str] = None
-    model_name: Optional[str] = settings.default_embedding_model
+    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
+    description: str = Field(..., min_length=1, max_length=4000)
+    test_name: Optional[str] = Field(default=None, max_length=200)
+    class_name: Optional[str] = Field(default=None, max_length=255)
+    model_name: Optional[str] = Field(default=None, max_length=200)
     deterministic: bool = False  # True = bypass LLM, génération depuis les chunks
     model_config = {"protected_namespaces": ()}
 
+    def model_post_init(self, __ctx) -> None:
+        if not self.model_name:
+            self.model_name = settings.default_embedding_model
+
 
 class GenerateUnitTestRequest(BaseModel):
-    project_id: str
-    file_path: str
-    class_name: str
-    method_name: Optional[str] = None
-    description: str
-    test_name: Optional[str] = None
-    model_name: Optional[str] = settings.default_embedding_model
+    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
+    file_path: str = Field(..., min_length=1, max_length=500)
+    class_name: str = Field(..., min_length=1, max_length=255)
+    method_name: Optional[str] = Field(default=None, max_length=255)
+    description: str = Field(..., min_length=1, max_length=4000)
+    test_name: Optional[str] = Field(default=None, max_length=200)
+    model_name: Optional[str] = Field(default=None, max_length=200)
     model_config = {"protected_namespaces": ()}
+
+    def model_post_init(self, __ctx) -> None:
+        if not self.model_name:
+            self.model_name = settings.default_embedding_model
 
 
 class ResetSchemaRequest(BaseModel):
@@ -176,15 +211,23 @@ def _load_golden_dataset(filename: str, profile: str = "") -> List[Dict]:
         return []
 
     for ex in dataset:
-        if len(ex.get("test_ideal", "")) > MAX_SHOT_CHARS:
-            ex["test_ideal"] = ex["test_ideal"][:MAX_SHOT_CHARS] + "\n// [tronqué]\n}"
+        ti = ex.get("test_ideal", "")
+        if len(ti) > MAX_SHOT_CHARS:
+            truncated = ti[:MAX_SHOT_CHARS]
+            # Équilibrage approximatif des accolades : on referme autant de blocs
+            # ouverts que nécessaire au lieu d'ajouter un `}` aveugle qui pouvait
+            # produire du PHP invalide en few-shot.
+            missing = max(0, truncated.count('{') - truncated.count('}'))
+            ex["test_ideal"] = truncated + "\n// [tronqué]\n" + ("}" * missing)
 
     if not dataset:
         return []
 
+    # Keywords disjoints — un même mot-clé ne doit pas appartenir à 2 profils
+    # (sinon le premier dans l'ordre d'itération gagne arbitrairement).
     PROFILE_KEYWORDS = {
-        "api":      ["ajax", "xhr", "api"],
-        "mixed":    ["mixte", "mixed", "ajax"],
+        "api":      ["xhr", "api", "ajax"],
+        "mixed":    ["mixte", "mixed"],
         "web_crud": ["crud", "formulaire", "form", "redirect"],
     }
 
@@ -211,10 +254,17 @@ def _check_ollama_alive(base_url: str, timeout: int = 5) -> bool:
     except Exception:
         return False
 
-def _call_llm(prompt: str, timeout: int = 600) -> str:
-    """Appelle Ollama et retourne le texte généré (nettoyé des balises markdown)."""
-    if not _check_ollama_alive(settings.ollama_url):
-        raise RuntimeError("Ollama injoignable — vérifiez que le service tourne sur host.docker.internal:11434")
+
+def _call_llm(prompt: str, timeout: int = 600, _skip_health: bool = False) -> str:
+    """
+    Appelle Ollama et retourne le texte généré (nettoyé des balises markdown).
+    `_skip_health` : permet de zapper le health-check sur les retries quand
+    on vient d'avoir un appel réussi (évite N+1 health-checks).
+    """
+    if not _skip_health and not _check_ollama_alive(settings.ollama_url):
+        raise RuntimeError(
+            f"Ollama injoignable — vérifiez que le service tourne sur {settings.ollama_url}"
+        )
     if len(prompt) > MAX_PROMPT_CHARS:
         logging.warning(f"[_call_llm] Prompt tronqué : {len(prompt)} → {MAX_PROMPT_CHARS} chars")
         prompt = prompt[:MAX_PROMPT_CHARS]
@@ -249,7 +299,13 @@ def _call_llm(prompt: str, timeout: int = 600) -> str:
     for line in resp.iter_lines():
         if not line:
             continue
-        chunk = json.loads(line)
+        try:
+            chunk = json.loads(line)
+        except json.JSONDecodeError:
+            # Ollama renvoie occasionnellement des lignes non-JSON (logs internes,
+            # message d'erreur). On les ignore plutôt que de tuer la génération.
+            logging.debug(f"[_call_llm] ligne ignorée (non-JSON) : {line[:100]!r}")
+            continue
         code_parts.append(chunk.get("response", ""))
         eval_count += 1
         if chunk.get("done"):
@@ -461,19 +517,28 @@ def _resolve_route(route: str) -> str:
     return _RE_ROUTE_PARAM.sub(replace, route)
 
 
+@lru_cache(maxsize=1)
+def _role_key_map() -> Dict[str, str]:
+    """
+    Parse settings.auth_role_key_map ("ROLE_A:KEY_A,ROLE_B:KEY_B") une seule fois.
+    Le cache est invalidé naturellement si le process redémarre (settings est figé).
+    """
+    raw = settings.auth_role_key_map or ""
+    mapping: Dict[str, str] = {}
+    for pair in raw.split(","):
+        if ":" not in pair:
+            continue
+        src, dst = pair.split(":", 1)
+        mapping[src.strip()] = dst.strip()
+    return mapping
+
+
 def _role_to_factory_key(role: str) -> str:
     """
-    Mappe un rôle Symfony (ex: ROLE_PARCOURS) vers la clé attendue par TestUserFactory
-    (ex: PARCOURS).  Le mapping est défini dans settings.auth_role_key_map sous la forme
-    "ROLE_A:KEY_A,ROLE_B:KEY_B".  Sans mapping, le rôle est retourné tel quel.
+    Mappe un rôle Symfony (ex: ROLE_PARCOURS) vers la clé attendue par TestUserFactory.
+    Sans mapping, le rôle est retourné tel quel.
     """
-    if settings.auth_role_key_map:
-        for pair in settings.auth_role_key_map.split(","):
-            if ":" in pair:
-                src, dst = pair.strip().split(":", 1)
-                if src.strip() == role:
-                    return dst.strip()
-    return role
+    return _role_key_map().get(role, role)
 
 
 def _detect_controller_profile(chunks: List[Dict]) -> str:
@@ -914,7 +979,7 @@ SCENARIO_BUILDERS = [
 # ENDPOINTS — SANTÉ ET ADMINISTRATION
 # ---------------------------------------------------------------------------
 
-@app.get("/health", summary="Vérification de santé")
+@app.get("/health", summary="Vérification de santé", tags=["santé"])
 async def health_check(db: KnowledgeDB = Depends(get_db)):
     """Vérifie que l'API et la base de données sont opérationnelles."""
     try:
@@ -931,6 +996,7 @@ async def health_check(db: KnowledgeDB = Depends(get_db)):
 @app.get(
     "/project/{project_id}/stats",
     summary="Statistiques d'un projet",
+    tags=["projets"],
     dependencies=[Depends(require_api_key)],
 )
 async def project_stats(project_id: str, db: KnowledgeDB = Depends(get_db)):
@@ -944,6 +1010,7 @@ async def project_stats(project_id: str, db: KnowledgeDB = Depends(get_db)):
 @app.delete(
     "/project/{project_id}",
     summary="Supprime les données d'un projet",
+    tags=["projets"],
     dependencies=[Depends(require_api_key)],
 )
 async def delete_project(project_id: str, db: KnowledgeDB = Depends(get_db)):
@@ -958,6 +1025,7 @@ async def delete_project(project_id: str, db: KnowledgeDB = Depends(get_db)):
 @app.post(
     "/admin/reset-schema",
     summary="Réinitialise toute la base de données",
+    tags=["admin"],
     dependencies=[Depends(require_api_key)],
 )
 def reset_schema(
@@ -990,6 +1058,7 @@ def reset_schema(
 @app.post(
     "/learn-from-code",
     summary="Indexe le code source du projet Symfony",
+    tags=["indexation"],
     dependencies=[Depends(require_api_key)],
 )
 def learn_from_code(
@@ -1222,6 +1291,7 @@ def learn_from_code(
 @app.post(
     "/generate-test",
     summary="Génère un test fonctionnel Symfony (WebTestCase)",
+    tags=["génération"],
     dependencies=[Depends(require_api_key)],
 )
 def generate_test(
@@ -1250,14 +1320,20 @@ def generate_test(
             if c["content"] not in existing_contents:
                 context_chunks.insert(0, c)
 
-    # Lookup templates : toujours injecter des chunks Twig dans le contexte
-    tpl_limit = 3 if data.class_name else 5
-    template_vec = brain.encode(["template twig h1 bouton lien formulaire champ"])[0]
-    template_chunks = db.find_closest_code_context(data.project_id, template_vec, limit=tpl_limit)
-    seen = {c["content"] for c in context_chunks}
-    for c in template_chunks:
-        if c["content"] not in seen:
-            context_chunks.append(c)
+    # Lookup templates : seulement si le contrôleur rend des vues (render).
+    # Pour un contrôleur API pur (json), c'est du bruit qui consomme le budget tokens.
+    needs_templates = any(
+        "render" in c.get("content", "").lower() or "template:" in c.get("content", "").lower()
+        for c in context_chunks
+    )
+    if needs_templates:
+        tpl_limit = 3 if data.class_name else 5
+        template_vec = brain.encode(["template twig h1 bouton lien formulaire champ"])[0]
+        template_chunks = db.find_closest_code_context(data.project_id, template_vec, limit=tpl_limit)
+        seen = {c["content"] for c in context_chunks}
+        for c in template_chunks:
+            if c["content"] not in seen:
+                context_chunks.append(c)
 
     # Filtre post-retrieval pour réduire le bruit
     if data.class_name:
@@ -1422,7 +1498,13 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
                 f"Retourne TOUT le fichier corrigé commençant par <?php, sans markdown.\n\n"
                 f"Code actuel :\n{code}"
             )
-            code = _call_llm(fix_prompt)
+            code = _call_llm(fix_prompt, _skip_health=True)
+            # Re-validation : on logge si le retry n'a toujours pas comblé le manque
+            still_missing = _validate_coverage(code, context_chunks)
+            if still_missing:
+                logging.warning(
+                    f"[generate-test] Après retry, routes toujours manquantes : {still_missing}"
+                )
 
         # Validation + correction syntaxique
         error = validate_php_syntax(code)
@@ -1430,7 +1512,7 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
             logging.warning(f"[generate-test] Erreur syntaxe PHP : {error}")
             fix_system = "Corrige l'erreur de syntaxe PHP suivante et retourne TOUT le code corrigé commençant par <?php, sans markdown."
             fix_prompt = _build_prompt(fix_system, [], f"Erreur : {error}\n\nCode à corriger :\n{code}")
-            code = _call_llm(fix_prompt)
+            code = _call_llm(fix_prompt, _skip_health=True)
 
         # Écriture du fichier dans le projet
         safe_name = re.sub(r"[^a-zA-Z0-9]", "", data.test_name or "GeneratedTest")
@@ -1459,6 +1541,7 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
 @app.post(
     "/generate-unit-test",
     summary="Génère un test unitaire PHPUnit",
+    tags=["génération"],
     dependencies=[Depends(require_api_key)],
 )
 def generate_unit_test(
@@ -1535,7 +1618,7 @@ DIRECTIVES :
                 few_shots,
                 f"Erreur : {error}\n\nCode à corriger :\n{code}"
             )
-            code = _call_llm(fix_prompt)
+            code = _call_llm(fix_prompt, _skip_health=True)
 
         # Détermine le sous-dossier selon le type de classe
         # class_short est sanitizé pour empêcher tout `..` ou `/` injecté via class_name

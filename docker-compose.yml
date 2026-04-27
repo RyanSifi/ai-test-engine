@@ -55,6 +55,10 @@ services:
     depends_on:
       vector-db:
         condition: service_healthy   # Attend que PostgreSQL accepte les connexions
+    # Sur Docker Engine Linux (sans Docker Desktop), host.docker.internal n'est pas
+    # résolu par défaut. Cette ligne le mappe vers la passerelle hôte.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - internal_ai
     healthcheck:

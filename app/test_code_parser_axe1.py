@@ -22,8 +22,32 @@ from code_parser import (
 # Fixtures
 # ---------------------------------------------------------------------------
 
-CREANCE_PHP = open("/mnt/user-data/uploads/CreanceController.php", "r", encoding="utf-8").read()
-ETAT_PHP    = open("/mnt/user-data/uploads/EtatImportController.php", "r", encoding="utf-8").read()
+# Chemins des fixtures contrôlables via env vars (CI / autre poste).
+# Par défaut : tests/fixtures/ relatif à ce fichier.
+_FIXTURES_DIR = os.environ.get(
+    "AXE1_FIXTURES_DIR",
+    os.path.join(os.path.dirname(__file__), "tests", "fixtures"),
+)
+_CREANCE_PATH = os.environ.get(
+    "AXE1_CREANCE_PATH",
+    os.path.join(_FIXTURES_DIR, "CreanceController.php"),
+)
+_ETAT_PATH = os.environ.get(
+    "AXE1_ETAT_PATH",
+    os.path.join(_FIXTURES_DIR, "EtatImportController.php"),
+)
+
+if not (os.path.isfile(_CREANCE_PATH) and os.path.isfile(_ETAT_PATH)):
+    print(
+        "Fixtures introuvables — tests d'intégration ignorés.\n"
+        f"  CreanceController.php attendu à : {_CREANCE_PATH}\n"
+        f"  EtatImportController.php attendu à : {_ETAT_PATH}\n"
+        "  Surcharge possible : AXE1_CREANCE_PATH / AXE1_ETAT_PATH / AXE1_FIXTURES_DIR"
+    )
+    sys.exit(0)
+
+CREANCE_PHP = open(_CREANCE_PATH, "r", encoding="utf-8").read()
+ETAT_PHP    = open(_ETAT_PATH,    "r", encoding="utf-8").read()
 
 PASSED  = 0
 FAILED  = 0

@@ -3,6 +3,23 @@ import re
 from typing import List, Dict, Optional
 import logging
 
+
+def _read_php_file(file_path: str) -> str:
+    """
+    Lit un fichier PHP/Twig en tolérant les encodages non-UTF8 fréquents
+    (Latin-1 dans les vieux projets Symfony français). Évite que des
+    contrôleurs entiers soient silencieusement ignorés sur UnicodeDecodeError.
+    """
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    # Dernier recours : on remplace les bytes invalides
+    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
 # ---------------------------------------------------------------------------
 # CONSTANTES REGEX
 # ---------------------------------------------------------------------------
@@ -674,8 +691,7 @@ def analyze_project_code(project_base_path: str) -> Dict:
                     continue
                 file_path = os.path.join(root, filename)
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        content = f.read()
+                    content = _read_php_file(file_path)
                     parsed = _parse_file_content(content)
                     if parsed and parsed.get("class_name"):
                         analysis[key].append({
@@ -701,8 +717,7 @@ def analyze_project_code(project_base_path: str) -> Dict:
                     continue
                 file_path = os.path.join(root, filename)
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        content = f.read()
+                    content = _read_php_file(file_path)
 
                     # Titre de page ({% set page_title = '...' %})
                     page_titles = TWIG_PAGE_TITLE_REGEX.findall(content)
@@ -800,12 +815,11 @@ def extract_code_for_symbol(
     (plus robuste qu'une regex naïve).
     Retourne une liste de lignes ou None si l'élément est introuvable.
     """
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
+    if not os.path.isfile(file_path):
         logging.error(f"Fichier non trouvé : {file_path}")
         return None
+    try:
+        content = _read_php_file(file_path)
     except Exception as e:
         logging.error(f"Erreur lecture {file_path}: {e}")
         return None

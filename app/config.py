@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     # Si vide, l'authentification est désactivée (utile en dev). À DÉFINIR en prod.
     api_key: Optional[str] = None
 
+    # CORS — origins autorisées, séparées par des virgules.
+    # "*" autorise tout (à éviter en prod). Vide = CORS désactivé.
+    cors_origins: str = ""
+
     # Contexte d'authentification injecté dans le prompt et le générateur déterministe.
     # Adapter ces valeurs à votre projet dans le .env si nécessaire.
     auth_firewall_name: str = "secured_area"         # nom du firewall Symfony (security.yaml)
