@@ -8,6 +8,14 @@ class Settings(BaseSettings):
     ollama_url: str = "http://host.docker.internal:11434/api/generate"
     default_embedding_model: str = 'paraphrase-multilingual-MiniLM-L12-v2'
     default_llm_model: str = 'qwen2.5-coder:7b'
+    # Allowlist de modèles d'embedding chargeables via /learn-from-code et /generate-test.
+    # Empêche un appelant de forcer le téléchargement d'un modèle arbitraire depuis HuggingFace.
+    # Format CSV. Le default_embedding_model est toujours autorisé implicitement.
+    allowed_embedding_models: str = (
+        "paraphrase-multilingual-MiniLM-L12-v2,"
+        "all-MiniLM-L6-v2,"
+        "all-mpnet-base-v2"
+    )
     container_project_root: str = "/workspace"
     host_project_root: Optional[str] = None
 

@@ -32,7 +32,28 @@ def get_db() -> KnowledgeDB:
     return KnowledgeDB(os.getenv("DATABASE_URL"))
 
 
-@lru_cache
+def _allowed_embedding_models() -> set:
+    """Set des modèles autorisés (default toujours inclus)."""
+    raw = settings.allowed_embedding_models or ""
+    allowed = {m.strip() for m in raw.split(",") if m.strip()}
+    allowed.add(settings.default_embedding_model)
+    return allowed
+
+
+def _check_model_allowed(model_name: str) -> None:
+    """Refuse les noms de modèle hors allowlist (anti-DL HuggingFace arbitraire)."""
+    if model_name not in _allowed_embedding_models():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Modèle '{model_name}' non autorisé. "
+                f"Liste : {sorted(_allowed_embedding_models())}"
+            ),
+        )
+
+
+# maxsize plafonné pour éviter qu'un attaquant n'épuise la RAM en variant model_name
+@lru_cache(maxsize=4)
 def get_brain(model_name: str) -> SemanticEngine:
     return SemanticEngine(model_name=model_name)
 
@@ -240,9 +261,30 @@ def _call_llm(prompt: str, timeout: int = 600) -> str:
     return code.replace("```php", "").replace("```", "").strip()
 
 
+def _safe_join(base: str, *parts: str) -> str:
+    """
+    Joint et résout un chemin relatif sous `base`.
+    Lève HTTPException(400) si le résultat sort de `base` (path traversal).
+    """
+    base_real = os.path.realpath(base)
+    candidate = os.path.realpath(os.path.join(base_real, *parts))
+    # Comparaison avec un séparateur final pour empêcher /workspace-evil de matcher /workspace
+    if candidate != base_real and not candidate.startswith(base_real + os.sep):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chemin invalide (hors workspace) : {os.path.join(*parts)}",
+        )
+    return candidate
+
+
+def _sanitize_path_component(name: str) -> str:
+    """Garde uniquement les caractères sûrs pour un nom de fichier ou dossier."""
+    return re.sub(r"[^a-zA-Z0-9_-]", "", name) or "Unnamed"
+
+
 def _write_php_file(relative_path: str, code: str) -> str:
     """Écrit un fichier PHP dans le workspace et retourne son chemin absolu."""
-    full_path = os.path.join(settings.container_project_root, relative_path)
+    full_path = _safe_join(settings.container_project_root, relative_path)
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     with open(full_path, "w", encoding="utf-8") as f:
         f.write(code)
@@ -337,6 +379,9 @@ def _validate_coverage(generated_code: str, context_chunks: List[Dict]) -> List[
     """
     Retourne la liste des routes présentes dans les chunks
     mais absentes du code généré.
+
+    Les paramètres dynamiques {id} sont remplacés par un wildcard non-quote,
+    de sorte que /foo/{id} matche /foo/1 ou /foo/dupont dans le code généré.
     """
     missing = []
     for c in context_chunks:
@@ -344,7 +389,11 @@ def _validate_coverage(generated_code: str, context_chunks: List[Dict]) -> List[
         if not route_m:
             continue
         route = route_m.group(1)
-        route_pattern = re.sub(r"\{[^}]+\}", r"[^'\"]+", re.escape(route))
+        # Découper la route sur les paramètres {…}, échapper les segments littéraux
+        # puis joindre avec le wildcard. Évite l'écueil de re.escape qui transforme
+        # {id} en \{id\} et casse une substitution naïve.
+        literal_parts = re.split(r"\{[^}]+\}", route)
+        route_pattern = r"[^'\"\s]+".join(re.escape(p) for p in literal_parts)
         if not re.search(route_pattern, generated_code):
             missing.append(route)
     return missing
@@ -493,9 +542,10 @@ def _generate_php_test_from_chunks(
     Chaque scénario est un dict qui décrit un test PHP à générer.
     Ajouter un nouveau pattern = ajouter un builder dans SCENARIO_BUILDERS.
     """
-    class_role   = _detect_class_role(chunks)
-    all_roles    = [r.strip() for r in settings.auth_test_roles.split(",")]
-    secondary_roles = [r for r in all_roles if r != class_factory_key]
+    class_role        = _detect_class_role(chunks)
+    class_factory_key = _role_to_factory_key(class_role)
+    all_roles         = [r.strip() for r in settings.auth_test_roles.split(",")]
+    secondary_roles   = [r for r in all_roles if r != class_factory_key]
     fw            = settings.auth_firewall_name
     redirect_path = settings.auth_redirect_path
     redirect_code = settings.auth_redirect_status
@@ -944,6 +994,7 @@ async def learn_from_code(
             detail=f"Workspace introuvable : {project_path}",
         )
 
+    _check_model_allowed(data.model_name)
     brain = get_brain(model_name=data.model_name)
 
     try:
@@ -1161,6 +1212,7 @@ async def generate_test(
     en utilisant le contexte RAG (routes, templates, formulaires) du projet.
     """
     start_time = time.time()
+    _check_model_allowed(data.model_name)
     brain = get_brain(model_name=data.model_name)
     query_vec = brain.encode([data.description])[0]
 
@@ -1394,8 +1446,8 @@ async def generate_unit_test(
     """
     start_time = time.time()
 
-    # Extraction du code source à tester
-    abs_file_path = os.path.join(settings.container_project_root, data.file_path)
+    # Extraction du code source à tester (path traversal protégé via _safe_join)
+    abs_file_path = _safe_join(settings.container_project_root, data.file_path)
     code_lines = extract_code_for_symbol(abs_file_path, data.class_name, data.method_name)
     if not code_lines:
         raise HTTPException(
@@ -1461,7 +1513,8 @@ DIRECTIVES :
             code = _call_llm(fix_prompt)
 
         # Détermine le sous-dossier selon le type de classe
-        class_short = data.class_name.split("\\")[-1]
+        # class_short est sanitizé pour empêcher tout `..` ou `/` injecté via class_name
+        class_short = _sanitize_path_component(data.class_name.split("\\")[-1])
         category    = "Service" if "Service" in data.file_path else (
                       "Controller" if "Controller" in data.file_path else "Unit"
                   )
