@@ -408,22 +408,45 @@ def _classify_controller(
 # PARSING D'UN FICHIER PHP
 # ---------------------------------------------------------------------------
 
+_PARAM_MODIFIERS = {"private", "public", "protected", "readonly", "abstract", "final", "static"}
+
+# Regex hissées en module pour éviter la recompilation à chaque méthode
+_PHPDOC_BACK_RE     = re.compile(r"/\*\*.*?\*/", re.DOTALL)
+_ATTR_BACK_RE       = re.compile(r"(?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+", re.DOTALL)
+_CLOSE_BRACE_RE     = re.compile(r'(?:\n[ \t]*\}|\}[ \t]*\n)')
+_OPEN_CLASS_BRACE_RE = re.compile(r'\n[ \t]*\{')
+_LOOKBACK_CHARS     = 600
+
+
 def _extract_params(params_str: str) -> List[Dict]:
-    """Transforme la chaîne des paramètres d'une méthode en liste structurée."""
+    """
+    Transforme la chaîne des paramètres d'une méthode en liste structurée.
+    Gère les valeurs par défaut (= 1, = null, = []), les modifiers de promotion
+    de propriétés (private readonly), les types nullables (?Foo) et namespacés.
+    """
     params = []
-    modifiers = {"private", "public", "protected", "readonly", "abstract", "final", "static"}
     for raw in params_str.split(','):
         raw = raw.strip()
         if not raw:
             continue
+        # Retire la valeur par défaut éventuelle (= ...)
+        if '=' in raw:
+            raw = raw.split('=', 1)[0].strip()
         parts = raw.split()
-        if len(parts) >= 2:
-            type_parts = [p for p in parts[:-1] if p not in modifiers]
-            param_type = type_parts[-1].lstrip('?\\') if type_parts else None
-            param_name = parts[-1].lstrip('$')
-            params.append({"type": param_type, "name": param_name})
-        elif len(parts) == 1:
-            params.append({"type": None, "name": parts[0].lstrip('$')})
+        if not parts:
+            continue
+        # Le nom du paramètre est le dernier token qui commence par '$'
+        name_idx = next(
+            (i for i in range(len(parts) - 1, -1, -1) if parts[i].startswith('$')),
+            -1,
+        )
+        if name_idx == -1:
+            continue
+        param_name = parts[name_idx].lstrip('$')
+        # Le type, s'il y en a un, est le dernier token avant le nom (hors modifiers)
+        type_tokens = [p for p in parts[:name_idx] if p not in _PARAM_MODIFIERS]
+        param_type = type_tokens[-1].lstrip('?\\') if type_tokens else None
+        params.append({"type": param_type, "name": param_name})
     return params
 
 
@@ -463,20 +486,17 @@ def _parse_file_content(content: str) -> Dict:
         class_header = content[:class_def_start]
         class_grants = _extract_isgranted_from_attrs(class_header)
 
-    # On trouve les méthodes (function + paramètres)
-    # Regex simple : ne capture QUE le nom et les params (pas le PHPDoc ni les attributs)
+    # On trouve les méthodes (function + paramètres).
+    # Accepte n'importe quel ordre de modificateurs (final/abstract/static/visibilité)
+    # et `function` seul (visibilité publique implicite). Ne capture QUE le nom et les params.
     FUNC_RE = re.compile(
-        r"(?:public|protected|private)\s+function\s+"
+        r"(?:(?:public|protected|private|final|abstract|static)\s+)*"
+        r"function\s+"
         r"([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)"  # nom
         r"\s*\((.*?)\)"                                   # params (non-greedy, DOTALL)
-        r"(?:\s*:\s*([a-zA-Z0-9_|\\\[\]\?]+))?",         # retour optionnel
+        r"(?:\s*:\s*(\??[a-zA-Z0-9_|\\\[\]&]+))?",       # retour optionnel (nullable / union / intersection)
         re.DOTALL
     )
-
-    # Pour chaque méthode, remonter pour récupérer PHPDoc + attributs ---
-    PHPDOC_BACK_RE   = re.compile(r"/\*\*.*?\*/", re.DOTALL)
-    ATTR_BACK_RE     = re.compile(r"(?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+", re.DOTALL)
-    LOOKBACK_CHARS   = 600  # taille de la fenêtre de recherche vers l'arrière
 
     methods = []
     constructor_params: List[Dict] = []
@@ -493,20 +513,17 @@ def _parse_file_content(content: str) -> Dict:
         #   - Accolade en début de ligne (méthodes multi-lignes) :  \n[ \t]*}
         #   - Accolade en fin de ligne   (méthodes inline)        :  }[ \t]*\n
         # Cela évite de confondre avec des { } dans des strings (ex. "/{id}").
-        window_start = max(0, func_start - LOOKBACK_CHARS)
+        window_start = max(0, func_start - _LOOKBACK_CHARS)
         raw_window   = content[window_start:func_start]
 
-        # Matches des accolades fermantes de méthode (début OU fin de ligne)
-        CLOSE_BRACE_RE = re.compile(r'(?:\n[ \t]*\}|\}[ \t]*\n)')
-        close_brace_matches = list(CLOSE_BRACE_RE.finditer(raw_window))
+        close_brace_matches = list(_CLOSE_BRACE_RE.finditer(raw_window))
         if close_brace_matches:
             # Couper juste après la dernière accolade fermante détectée
             cut = close_brace_matches[-1].end()
             window = raw_window[cut:]
         else:
             # Pas de méthode précédente : délimiter au début du corps de classe
-            OPEN_CLASS_BRACE_RE = re.compile(r'\n[ \t]*\{')
-            open_matches = list(OPEN_CLASS_BRACE_RE.finditer(raw_window))
+            open_matches = list(_OPEN_CLASS_BRACE_RE.finditer(raw_window))
             if open_matches:
                 window = raw_window[open_matches[-1].end():]
             else:
@@ -514,13 +531,13 @@ def _parse_file_content(content: str) -> Dict:
 
         # PHPDoc : on prend le DERNIER bloc /** ... */ dans la fenêtre
         phpdoc = ""
-        phpdoc_matches = list(PHPDOC_BACK_RE.finditer(window))
+        phpdoc_matches = list(_PHPDOC_BACK_RE.finditer(window))
         if phpdoc_matches:
             phpdoc = phpdoc_matches[-1].group(0)
 
         # Attributs PHP 8 : on prend le DERNIER bloc #[...] dans la fenêtre
         route_attr = ""
-        attr_matches = list(ATTR_BACK_RE.finditer(window))
+        attr_matches = list(_ATTR_BACK_RE.finditer(window))
         if attr_matches:
             route_attr = attr_matches[-1].group(0)
 

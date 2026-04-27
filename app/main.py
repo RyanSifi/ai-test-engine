@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 import requests
 import re
 from pydantic import BaseModel
@@ -38,6 +38,18 @@ def _allowed_embedding_models() -> set:
     allowed = {m.strip() for m in raw.split(",") if m.strip()}
     allowed.add(settings.default_embedding_model)
     return allowed
+
+
+def require_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> None:
+    """
+    Dépendance d'auth : si settings.api_key est défini, exige le header X-API-Key
+    avec la même valeur. Sinon (dev), laisse passer.
+    """
+    expected = settings.api_key
+    if not expected:
+        return
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="API key invalide ou manquante")
 
 
 def _check_model_allowed(model_name: str) -> None:
@@ -93,17 +105,6 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 # MODÈLES PYDANTIC
 # ---------------------------------------------------------------------------
-
-class RouteDefinition(BaseModel):
-    path: str
-    method: str
-    name: str
-
-
-class ScenarioDefinition(BaseModel):
-    description: str
-    input_json: Optional[str] = "{}"
-
 
 class LearnFromCodeRequest(BaseModel):
     project_id: str
@@ -927,7 +928,11 @@ async def health_check(db: KnowledgeDB = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"DB non disponible : {e}")
 
 
-@app.get("/project/{project_id}/stats", summary="Statistiques d'un projet")
+@app.get(
+    "/project/{project_id}/stats",
+    summary="Statistiques d'un projet",
+    dependencies=[Depends(require_api_key)],
+)
 async def project_stats(project_id: str, db: KnowledgeDB = Depends(get_db)):
     """Retourne le nombre de chunks et de routes indexés pour un projet."""
     try:
@@ -936,7 +941,11 @@ async def project_stats(project_id: str, db: KnowledgeDB = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/project/{project_id}", summary="Supprime les données d'un projet")
+@app.delete(
+    "/project/{project_id}",
+    summary="Supprime les données d'un projet",
+    dependencies=[Depends(require_api_key)],
+)
 async def delete_project(project_id: str, db: KnowledgeDB = Depends(get_db)):
     """Supprime toutes les données indexées pour un projet donné."""
     try:
@@ -946,8 +955,12 @@ async def delete_project(project_id: str, db: KnowledgeDB = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/admin/reset-schema", summary="Réinitialise toute la base de données")
-async def reset_schema(
+@app.post(
+    "/admin/reset-schema",
+    summary="Réinitialise toute la base de données",
+    dependencies=[Depends(require_api_key)],
+)
+def reset_schema(
     body: ResetSchemaRequest,
     db: KnowledgeDB = Depends(get_db),
 ):
@@ -974,8 +987,12 @@ async def reset_schema(
 # ENDPOINT — APPRENTISSAGE
 # ---------------------------------------------------------------------------
 
-@app.post("/learn-from-code", summary="Indexe le code source du projet Symfony")
-async def learn_from_code(
+@app.post(
+    "/learn-from-code",
+    summary="Indexe le code source du projet Symfony",
+    dependencies=[Depends(require_api_key)],
+)
+def learn_from_code(
     data: LearnFromCodeRequest,
     db: KnowledgeDB = Depends(get_db),
 ):
@@ -1180,9 +1197,9 @@ async def learn_from_code(
         # ── Encodage + sauvegarde ───────────────────────────────────────────
         vectors = brain.encode([c["content"] for c in chunks])
         db.init_schema(vector_size=len(vectors[0]))
-        # Supprime les anciennes données du projet avant de ré-indexer
-        db.clear_project(project_id)
-        db.save_code_context(project_id, chunks, vectors)
+        # Ré-indexation atomique : delete + insert dans la même transaction
+        # → pas de fenêtre où le projet apparaît vide aux requêtes concurrentes.
+        db.reindex_project(project_id, chunks, vectors)
 
         logging.info(
             f"[learn-from-code] {len(chunks)} chunks indexés pour '{project_id}'."
@@ -1202,8 +1219,12 @@ async def learn_from_code(
 # ENDPOINT — GÉNÉRATION DE TEST FONCTIONNEL
 # ---------------------------------------------------------------------------
 
-@app.post("/generate-test", summary="Génère un test fonctionnel Symfony (WebTestCase)")
-async def generate_test(
+@app.post(
+    "/generate-test",
+    summary="Génère un test fonctionnel Symfony (WebTestCase)",
+    dependencies=[Depends(require_api_key)],
+)
+def generate_test(
     data: GenerateTestRequest,
     db: KnowledgeDB = Depends(get_db),
 ):
@@ -1435,8 +1456,12 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
 # ENDPOINT — GÉNÉRATION DE TEST UNITAIRE
 # ---------------------------------------------------------------------------
 
-@app.post("/generate-unit-test", summary="Génère un test unitaire PHPUnit")
-async def generate_unit_test(
+@app.post(
+    "/generate-unit-test",
+    summary="Génère un test unitaire PHPUnit",
+    dependencies=[Depends(require_api_key)],
+)
+def generate_unit_test(
     data: GenerateUnitTestRequest,
     db: KnowledgeDB = Depends(get_db),
 ):
@@ -1533,21 +1558,3 @@ DIRECTIVES :
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINTS LEGACY (dépréciés, conservés pour compatibilité)
-# ---------------------------------------------------------------------------
-
-@app.post("/learn", include_in_schema=False)
-async def legacy_learn():
-    return {
-        "status":  "deprecated",
-        "message": "Utilisez POST /learn-from-code",
-    }
-
-
-@app.post("/predict", include_in_schema=False)
-async def legacy_predict():
-    return {
-        "status":  "deprecated",
-        "message": "Utilisez POST /generate-test",
-    }

@@ -1,5 +1,5 @@
 from sentence_transformers import SentenceTransformer
-import numpy as np
+
 
 class SemanticEngine:
     def __init__(self, model_name: str = 'paraphrase-multilingual-MiniLM-L12-v2'):

@@ -17,7 +17,10 @@ class Settings(BaseSettings):
         "all-mpnet-base-v2"
     )
     container_project_root: str = "/workspace"
-    host_project_root: Optional[str] = None
+
+    # Clé API requise sur les endpoints d'écriture (header X-API-Key).
+    # Si vide, l'authentification est désactivée (utile en dev). À DÉFINIR en prod.
+    api_key: Optional[str] = None
 
     # Contexte d'authentification injecté dans le prompt et le générateur déterministe.
     # Adapter ces valeurs à votre projet dans le .env si nécessaire.

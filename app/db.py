@@ -1,28 +1,55 @@
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import execute_values
-import json
-from typing import List, Dict
+from contextlib import contextmanager
+from typing import List, Dict, Optional
+
+
+# ID arbitraire et stable pour pg_advisory_lock — empêche la course
+# entre plusieurs workers uvicorn qui appellent init_schema simultanément.
+_INIT_LOCK_ID = 8472_31415
 
 
 class KnowledgeDB:
     """
     Gère toutes les interactions avec PostgreSQL/pgvector :
     schéma, indexation des chunks de code et recherche sémantique.
+
+    Utilise un pool de connexions thread-safe (psycopg2.pool.ThreadedConnectionPool).
     """
 
-    def __init__(self, db_url: str):
+    def __init__(self, db_url: str, minconn: int = 1, maxconn: int = 10):
         self.db_url = db_url
+        self._pool: Optional[pool.ThreadedConnectionPool] = None
+        if db_url:
+            self._pool = pool.ThreadedConnectionPool(minconn, maxconn, db_url)
 
     # ------------------------------------------------------------------
-    # Connexion
+    # Connexion / context manager
     # ------------------------------------------------------------------
 
-    def get_conn(self):
-        """Ouvre et retourne une connexion PostgreSQL."""
-        # TODO: remplacer par un connection pool (psycopg2.pool.ThreadedConnectionPool
-        # ou SQLAlchemy) pour éviter la saturation sous charge concurrente.
-        # Actuellement chaque méthode ouvre et ferme sa propre connexion.
-        return psycopg2.connect(self.db_url)
+    @contextmanager
+    def _cursor(self, commit: bool = True):
+        """
+        Acquiert une connexion du pool, ouvre un curseur, et la rend au pool
+        à la fin (rollback si exception, commit sinon par défaut).
+        """
+        if self._pool is None:
+            raise RuntimeError("Pool de connexions non initialisé.")
+        conn = self._pool.getconn()
+        try:
+            cur = conn.cursor()
+            try:
+                yield cur
+                if commit:
+                    conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cur.close()
+        finally:
+            self._pool.putconn(conn)
 
     # ------------------------------------------------------------------
     # Schéma
@@ -30,68 +57,35 @@ class KnowledgeDB:
 
     def init_schema(self, vector_size: int = 384) -> None:
         """
-        Crée les tables si elles n'existent pas encore.
-        Ne fait RIEN si les tables sont déjà présentes (évite d'effacer
-        des données lors d'un simple redémarrage du service).
-        Pour recréer le schéma (ex. changement de modèle d'embedding),
-        appeler reset_schema() explicitement.
+        Crée la table project_code_context si elle n'existe pas encore.
+        Sérialisé via pg_advisory_lock pour éviter les courses entre workers.
         """
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            cur.execute("SELECT to_regclass('public.project_code_context');")
-            already_exists = cur.fetchone()[0] is not None
-            if already_exists:
-                return  # Tables OK, rien à faire
-            self._create_tables(cur, vector_size)
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+        with self._cursor() as cur:
+            cur.execute("SELECT pg_advisory_lock(%s);", (_INIT_LOCK_ID,))
+            try:
+                cur.execute("SELECT to_regclass('public.project_code_context');")
+                if cur.fetchone()[0] is not None:
+                    return
+                self._create_tables(cur, vector_size)
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s);", (_INIT_LOCK_ID,))
 
     def reset_schema(self, vector_size: int = 384) -> None:
         """
-        Supprime et recrée toutes les tables.
-        À utiliser uniquement lors d'un changement de modèle d'embedding
-        (dimension des vecteurs différente) ou d'une réinitialisation complète.
+        Supprime et recrée la table principale.
+        À utiliser uniquement lors d'un changement de modèle d'embedding.
         ⚠️  Toutes les données sont perdues.
         """
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
+        with self._cursor() as cur:
+            # Drop des anciennes tables legacy (peuvent exister sur d'anciennes installations)
             cur.execute("DROP TABLE IF EXISTS routes CASCADE;")
             cur.execute("DROP TABLE IF EXISTS scenarios CASCADE;")
             cur.execute("DROP TABLE IF EXISTS project_code_context CASCADE;")
             self._create_tables(cur, vector_size)
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
 
     def _create_tables(self, cur, vector_size: int) -> None:
-        """Crée l'extension pgvector et les trois tables du schéma."""
+        """Crée l'extension pgvector et la table de chunks de code."""
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-
-        cur.execute(f"""
-            CREATE TABLE routes (
-                id         SERIAL PRIMARY KEY,
-                project_id VARCHAR(100),
-                path       VARCHAR(500),
-                method     VARCHAR(10),
-                name       VARCHAR(255),
-                embedding  vector({vector_size})
-            );
-        """)
-
-        cur.execute(f"""
-            CREATE TABLE scenarios (
-                id          SERIAL PRIMARY KEY,
-                project_id  VARCHAR(100),
-                description TEXT,
-                input_json  TEXT,
-                embedding   vector({vector_size})
-            );
-        """)
 
         cur.execute(f"""
             CREATE TABLE project_code_context (
@@ -105,8 +99,8 @@ class KnowledgeDB:
             );
         """)
 
-        cur.execute("CREATE INDEX ON routes               USING hnsw (embedding vector_cosine_ops);")
         cur.execute("CREATE INDEX ON project_code_context USING hnsw (embedding vector_cosine_ops);")
+        cur.execute("CREATE INDEX ON project_code_context (project_id);")
 
     # ------------------------------------------------------------------
     # CRUD – projets
@@ -114,68 +108,20 @@ class KnowledgeDB:
 
     def clear_project(self, project_id: str) -> None:
         """Supprime toutes les données d'un projet (pour ré-indexation)."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            cur.execute("DELETE FROM routes                WHERE project_id = %s", (project_id,))
-            cur.execute("DELETE FROM scenarios             WHERE project_id = %s", (project_id,))
+        with self._cursor() as cur:
             cur.execute("DELETE FROM project_code_context WHERE project_id = %s", (project_id,))
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
 
     def list_projects(self) -> List[str]:
         """Retourne la liste de tous les project_id indexés."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            cur.execute("""
-                SELECT DISTINCT project_id FROM project_code_context
-                UNION
-                SELECT DISTINCT project_id FROM routes
-                ORDER BY project_id;
-            """)
+        with self._cursor(commit=False) as cur:
+            cur.execute(
+                "SELECT DISTINCT project_id FROM project_code_context ORDER BY project_id;"
+            )
             return [row[0] for row in cur.fetchall()]
-        finally:
-            cur.close()
-            conn.close()
 
     # ------------------------------------------------------------------
     # Sauvegarde
     # ------------------------------------------------------------------
-
-    def save_routes(self, project_id: str, routes: List, vectors: List) -> None:
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            data = [(project_id, r.path, r.method, r.name, v)
-                    for r, v in zip(routes, vectors)]
-            execute_values(
-                cur,
-                "INSERT INTO routes (project_id, path, method, name, embedding) VALUES %s",
-                data,
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
-
-    def save_scenarios(self, project_id: str, scenarios: List, vectors: List) -> None:
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            data = [(project_id, s.description, s.input_json, v)
-                    for s, v in zip(scenarios, vectors)]
-            execute_values(
-                cur,
-                "INSERT INTO scenarios (project_id, description, input_json, embedding) VALUES %s",
-                data,
-            )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
 
     def save_code_context(
         self,
@@ -183,9 +129,8 @@ class KnowledgeDB:
         chunks: List[Dict],
         vectors: List[List[float]],
     ) -> None:
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
+        """Insère les chunks et leurs embeddings. Atomique (commit unique)."""
+        with self._cursor() as cur:
             data = [
                 (
                     project_id,
@@ -206,37 +151,44 @@ class KnowledgeDB:
                 """,
                 data,
             )
-            conn.commit()
-        finally:
-            cur.close()
-            conn.close()
+
+    def reindex_project(
+        self,
+        project_id: str,
+        chunks: List[Dict],
+        vectors: List[List[float]],
+    ) -> None:
+        """
+        Supprime puis ré-insère les chunks d'un projet — atomique.
+        Évite la fenêtre de temps où le projet apparaît vide entre clear et save.
+        """
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM project_code_context WHERE project_id = %s", (project_id,))
+            if chunks:
+                data = [
+                    (
+                        project_id,
+                        chunk["chunk_type"],
+                        chunk["file_path"],
+                        chunk["class_name"],
+                        chunk["content"],
+                        vector,
+                    )
+                    for chunk, vector in zip(chunks, vectors)
+                ]
+                execute_values(
+                    cur,
+                    """
+                    INSERT INTO project_code_context
+                        (project_id, chunk_type, file_path, class_name, content, embedding)
+                    VALUES %s
+                    """,
+                    data,
+                )
 
     # ------------------------------------------------------------------
     # Recherche
     # ------------------------------------------------------------------
-
-    def find_closest_route(self, project_id: str, query_vector: List[float]) -> Dict:
-        """Trouve la route la plus similaire sémantiquement à la requête."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
-            cur.execute(
-                """
-                SELECT path, name, 1 - (embedding <=> %s::vector) AS similarity
-                FROM   routes
-                WHERE  project_id = %s
-                ORDER  BY embedding <=> %s::vector
-                LIMIT  1;
-                """,
-                (query_vector, project_id, query_vector),
-            )
-            row = cur.fetchone()
-            if row:
-                return {"path": row[0], "name": row[1], "score": float(row[2])}
-            return None
-        finally:
-            cur.close()
-            conn.close()
 
     def find_closest_code_context(
         self,
@@ -245,9 +197,7 @@ class KnowledgeDB:
         limit: int = 8,
     ) -> List[Dict]:
         """Retourne les N chunks de code les plus proches sémantiquement."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
+        with self._cursor(commit=False) as cur:
             cur.execute(
                 """
                 SELECT chunk_type, file_path, class_name, content,
@@ -269,15 +219,10 @@ class KnowledgeDB:
                 }
                 for row in cur.fetchall()
             ]
-        finally:
-            cur.close()
-            conn.close()
 
     def get_code_by_class_name(self, project_id: str, class_name: str) -> List[Dict]:
         """Récupère les chunks correspondant à une classe par son nom (ILIKE)."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
+        with self._cursor(commit=False) as cur:
             cur.execute(
                 """
                 SELECT chunk_type, file_path, class_name, content
@@ -296,30 +241,16 @@ class KnowledgeDB:
                 }
                 for row in cur.fetchall()
             ]
-        finally:
-            cur.close()
-            conn.close()
 
     def get_project_stats(self, project_id: str) -> Dict:
-        """Retourne des statistiques sur les données indexées d'un projet."""
-        conn = self.get_conn()
-        cur  = conn.cursor()
-        try:
+        """Retourne le nombre de chunks indexés pour un projet."""
+        with self._cursor(commit=False) as cur:
             cur.execute(
                 "SELECT COUNT(*) FROM project_code_context WHERE project_id = %s",
                 (project_id,),
             )
             chunk_count = cur.fetchone()[0]
-            cur.execute(
-                "SELECT COUNT(*) FROM routes WHERE project_id = %s",
-                (project_id,),
-            )
-            route_count = cur.fetchone()[0]
             return {
                 "project_id":  project_id,
                 "chunks":      chunk_count,
-                "routes":      route_count,
             }
-        finally:
-            cur.close()
-            conn.close()

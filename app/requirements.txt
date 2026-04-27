@@ -1,13 +1,11 @@
 fastapi==0.109.0
 uvicorn==0.27.0
 psycopg2-binary==2.9.9
-pgvector==0.2.4
 # all-mpnet-base-v2 (Priorité 4) nécessite sentence-transformers >= 2.6
-# Montée de version sans impact sur l'API publique de SemanticEngine.
 sentence-transformers==2.6.1
 pydantic==2.6.0
 pydantic-settings==2.1.0
-sqlalchemy==2.0.25
 requests==2.31.0
+# Tests : conservés ici car pas de pipeline CI séparé pour l'instant
 pytest==8.0.0
 httpx==0.26.0

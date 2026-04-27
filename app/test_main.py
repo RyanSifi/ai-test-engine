@@ -277,8 +277,9 @@ class TestLearnFromCode:
         body = r.json()
         assert body["status"]       == "success"
         assert body["total_chunks"] >= 2
-        mock_db.clear_project.assert_called_once_with("proj_test")
-        mock_db.save_code_context.assert_called_once()
+        mock_db.reindex_project.assert_called_once()
+        args, _ = mock_db.reindex_project.call_args
+        assert args[0] == "proj_test"
 
     def test_learn_warning_when_empty(self, client_with_mocks):
         client, _, _ = client_with_mocks
@@ -440,24 +441,6 @@ class TestGenerateUnitTest:
         assert body["status"] == "success"
         assert "FooServiceTest.php" in body["file"]
         mock_write.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Endpoints dépréciés
-# ---------------------------------------------------------------------------
-
-class TestDeprecated:
-    def test_legacy_learn(self, client_with_mocks):
-        client, _, _ = client_with_mocks
-        r = client.post("/learn", json={})
-        assert r.status_code == 200
-        assert r.json()["status"] == "deprecated"
-
-    def test_legacy_predict(self, client_with_mocks):
-        client, _, _ = client_with_mocks
-        r = client.post("/predict", json={})
-        assert r.status_code == 200
-        assert r.json()["status"] == "deprecated"
 
 
 # ---------------------------------------------------------------------------
