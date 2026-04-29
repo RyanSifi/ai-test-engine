@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Env / secrets
+.env
+.env.local
+*.env
+
+# Données runtime (volumes Docker)
+data/pg_data/
+data/ollama_data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+
+# Dataset ML (généré, gros)
+_dataset/
+ml/notebooks/.ipynb_checkpoints/
+ml/*.pkl
+ml/*.joblib

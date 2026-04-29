@@ -1,12 +1,24 @@
 # AI Test Engine
 
-Microservice FastAPI qui génère automatiquement des tests PHP (PHPUnit / WebTestCase Symfony) pour des applications Symfony, en utilisant un LLM local (Ollama) et un index vectoriel (PostgreSQL + pgvector) pour le RAG.
+Système hybride pour automatiser la génération de tests fonctionnels Symfony :
+
+1. **Module ML supervisé** ([ml/](ml/README.md)) — prédit le risque de régression
+   par méthode de controller à partir de l'historique git et des features de code
+   (XGBoost, F1=0.86 sur Sylius). Permet à la MOA de prioriser ses tests lors
+   d'un changement de version.
+
+2. **Moteur de génération RAG + LLM** ([app/](app/)) — génère des `WebTestCase`
+   Symfony à partir du code indexé (FastAPI + Ollama + pgvector).
+
+3. **Dashboard Streamlit** ([ml/streamlit_app.py](ml/streamlit_app.py)) —
+   interface MOA pour visualiser le risque et déclencher la génération.
 
 ## Stack
 
+- **ML** : pandas + scikit-learn + XGBoost + Streamlit
 - **API** : FastAPI + Uvicorn (Python 3.11)
 - **LLM local** : Ollama — `qwen2.5-coder:7b` par défaut
-- **Embeddings** : `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dims)
+- **Embeddings** : `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
 - **Vector store** : PostgreSQL 15 + pgvector (cosinus)
 - **Conteneurs** : Docker Compose
 
@@ -74,6 +86,30 @@ Si `API_KEY` est défini dans `.env`, tous les endpoints d'écriture exigent le 
 
 - **LLM (par défaut)** : `/generate-test` envoie le contexte RAG + few-shot au LLM Ollama. Risque d'hallucination, plus créatif.
 - **Déterministe** : `deterministic: true` dans le body. Génération directe depuis les chunks indexés, sans LLM. Pas d'hallucination, moins de variété.
+
+## Pipeline ML (séparé)
+
+```bash
+# 1. Cloner un projet Symfony pour le dataset (ex: Sylius)
+mkdir -p _dataset && git clone --depth=5000 https://github.com/Sylius/Sylius.git _dataset/sylius
+
+# 2. Installer les deps ML
+pip install -r ml/requirements.txt
+
+# 3. Extraire features + labels depuis git
+PYTHONIOENCODING=utf-8 python ml/extract_dataset.py _dataset/sylius _dataset/dataset.csv \
+    --since "36 months ago" --bugfix-threshold 1
+
+# 4. Entraîner LR + RF + XGBoost (avec GridSearch)
+PYTHONIOENCODING=utf-8 python ml/train.py _dataset/dataset.csv
+
+# 5. Lancer le dashboard
+streamlit run ml/streamlit_app.py
+# → http://localhost:8501
+```
+
+Voir [ml/README.md](ml/README.md) pour les détails (méthode, métriques,
+features, limites).
 
 ## Tests
 

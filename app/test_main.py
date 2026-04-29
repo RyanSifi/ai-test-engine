@@ -99,9 +99,11 @@ CHUNK_METHOD_DELETE_HIGH_ROLE = {
     "file_path":  "Controller/FooController.php",
     "class_name": "FooController",
     "content": (
+        # Rôle méthode SUPÉRIEUR au rôle classe (ADMIN) → doit générer un test 403
+        # pour un utilisateur qui n'a que le rôle classe.
         "Méthode 'delete' (FooController) — Route: /foo/{id}/delete\n"
         "  → Type de réponse: redirect (302)\n"
-        "  → Rôle requis (méthode): ADMIN\n"
+        "  → Rôle requis (méthode): SUPERADMIN\n"
         "  → Verbes HTTP: DELETE"
     ),
     "similarity": 0.85,
@@ -221,6 +223,8 @@ class TestLearnFromCode:
         with patch("main.settings") as mock_settings:
             mock_settings.container_project_root  = "/nonexistent/path"
             mock_settings.default_embedding_model = "paraphrase-multilingual-MiniLM-L12-v2"
+            mock_settings.api_key                 = None  # désactive l'auth pour ce test
+            mock_settings.allowed_embedding_models = "paraphrase-multilingual-MiniLM-L12-v2"
             r = client.post("/learn-from-code", json={"project_id": "proj_test"})
         assert r.status_code == 404
 
@@ -250,7 +254,7 @@ class TestLearnFromCode:
                     ],
                     "properties":        [],
                     "constructor_params": [],
-                    "class_grants":      ["ROLE_ADMIN"],
+                    "class_grants":      [{"role": "ROLE_ADMIN", "message": None}],
                     "controller_profile": "web_crud",
                 }
             ],
@@ -371,11 +375,14 @@ class TestGenerateTest:
     def test_syntax_error_triggers_llm_correction(self, client_with_mocks):
         client, _, _ = client_with_mocks
 
+        # On neutralise le retry de couverture (_validate_coverage → []) pour
+        # se concentrer sur le retry de syntaxe : 2 appels LLM exactement.
         with patch("main.requests.post") as mock_post, \
              patch("main.validate_php_syntax", side_effect=[
                  "Parse error: unexpected end",
                  None,
              ]), \
+             patch("main._validate_coverage", return_value=[]), \
              patch("main._write_php_file"), \
              patch("main._load_golden_dataset", return_value=[]):
 
