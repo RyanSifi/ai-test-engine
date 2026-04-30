@@ -582,15 +582,72 @@ def _extract_method_role(content: str, class_role: str) -> str:
     return class_role
 
 
-def _extract_http_verb(content: str) -> str:
-    """Extrait le verbe HTTP depuis un chunk, ou 'GET' par défaut."""
+# Heuristiques de détection des verbes HTTP par nom de méthode et de route.
+# Utilisé en fallback quand #[Route(methods: [...])] n'est pas explicite.
+_VERB_NAME_HINTS = {
+    "DELETE": ("delete", "remove", "destroy", "trash", "erase", "unlink"),
+    "PUT":    ("update", "edit", "modify", "replace", "put"),
+    "PATCH":  ("patch", "toggle", "enable", "disable", "activate", "deactivate"),
+    "POST":   ("create", "add", "new", "save", "store", "submit", "send",
+               "post", "register", "ajout", "ajouter", "creer", "creation",
+               "valider", "soumettre", "publier", "envoyer"),
+}
+
+
+def _infer_http_verb_from_name(method_name: str, route_path: str) -> Optional[str]:
+    """Infère un verbe HTTP depuis le nom de méthode ou la route, en français/anglais."""
+    name_l = method_name.lower()
+    route_l = route_path.lower() if route_path else ""
+
+    for verb, hints in _VERB_NAME_HINTS.items():
+        for hint in hints:
+            # Préfixe de méthode (deleteFoo, updateBar) ou suffixe de route (/delete, /update)
+            if name_l.startswith(hint) or f"/{hint}" in route_l or route_l.endswith(hint):
+                return verb
+    return None
+
+
+def _infer_http_verb_from_body(content: str) -> Optional[str]:
+    """
+    Infère un verbe POST si le body de la méthode contient des marqueurs typiques
+    (formulaire soumis, lecture du body de requête).
+    Le « body » est ici le résumé du chunk RAG, donc on cherche les marqueurs
+    indirects laissés par le parser : Formulaire détecté, etc.
+    """
+    if "Formulaire:" in content or "→ Formulaire" in content:
+        return "POST"
+    return None
+
+
+def _extract_http_verb(content: str, method_name: str = "", route_path: str = "") -> str:
+    """
+    Détermine le verbe HTTP à utiliser pour un test, par ordre de priorité :
+      1. Verbe explicite déclaré dans #[Route(methods: [...])]
+      2. Indices dans le body de la méthode (formulaire, etc.)
+      3. Heuristique sur le nom de méthode (delete*, update*, etc.) ou la route
+      4. GET par défaut
+    """
+    # 1. Verbe explicite
     m = _RE_HTTP_VERBS.search(content)
     if m:
-        verbs = [v.strip() for v in m.group(1).split(",")]
-        # Si GET et POST → POST pour les formulaires, sinon premier verbe
-        if "POST" in verbs:
-            return "POST"
-        return verbs[0]
+        verbs = [v.strip() for v in m.group(1).split(",") if v.strip()]
+        # Multi-verbes : prioriser POST > PUT > DELETE > PATCH > GET
+        for preferred in ("POST", "PUT", "DELETE", "PATCH", "GET"):
+            if preferred in verbs:
+                return preferred
+        if verbs:
+            return verbs[0]
+
+    # 2. Indices dans le body
+    inferred = _infer_http_verb_from_body(content)
+    if inferred:
+        return inferred
+
+    # 3. Heuristique nom + route
+    inferred = _infer_http_verb_from_name(method_name, route_path)
+    if inferred:
+        return inferred
+
     return "GET"
 
 
@@ -719,7 +776,7 @@ def _parse_chunk_metadata(content: str, raw_route: str, class_role: str) -> Dict
         "cap":            cap,
         "raw_route":      raw_route,
         "route":          _resolve_route(raw_route),
-        "http_verb":      _extract_http_verb(content),
+        "http_verb":      _extract_http_verb(content, method_name, raw_route),
         "method_role":    method_role,
         "class_role":     class_role,
         # Clés mappées pour getTestUser() — différentes de method_role si auth_role_key_map est défini
@@ -935,8 +992,41 @@ def _scenario_voter(ctx, fw, _rp, _rc, _sec_roles):
     }]
 
 
+def _scenario_not_found(ctx, fw, _rp, _rc, _sec_roles):
+    """
+    Pour les routes paramétrées ({id}, {slug}, …) : ID inexistant → 404.
+    Cas d'erreur classique que la MOA doit valider à chaque release.
+    Skippé pour les voters (déjà traité ailleurs) et les routes sans param.
+    """
+    if "{" not in ctx["raw_route"]:
+        return []
+    if ctx["has_voter"]:
+        return []
+    fk = ctx["factory_key"]
+    rl = ctx["role_label"]
+    # ID inexistant : 99999999 (peu de chances de tomber sur une vraie entité)
+    bogus_route = re.sub(r"\{[^}]+\}", "99999999", ctx["raw_route"])
+    return [{
+        "comment":   f"{ctx['raw_route']} — ressource inexistante → 404",
+        "func_name": f"test{ctx['cap']}NotFoundWith{rl}Role",
+        "body": [
+            f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
+            f"$this->client->request('{ctx['http_verb']}', '{bogus_route}');",
+            "self::assertContains(",
+            "    $this->client->getResponse()->getStatusCode(),",
+            "    [404, 302, 500],",
+            "    'Une ressource inexistante doit produire 404 (ou redirect/erreur applicative)'",
+            ");",
+        ],
+    }]
+
+
 def _scenario_secondary_role(ctx, fw, _rp, _rc, sec_roles):
-    """Vérifier qu'un rôle secondaire a aussi accès."""
+    """
+    Vérifie qu'un rôle secondaire a aussi accès. Réplique les assertions
+    sémantiques (assertJson, assertSelectorTextContains) du test ADMIN pour
+    éviter une asymétrie qui ferait passer un test à tort.
+    """
     if not sec_roles:
         return []
     if ctx["is_ajax"] or ctx["has_form"] or ctx["has_voter"]:
@@ -948,14 +1038,21 @@ def _scenario_secondary_role(ctx, fw, _rp, _rc, sec_roles):
     for sr in sec_roles[:1]:
         sr_fk    = _role_to_factory_key(sr)
         sr_label = sr_fk.replace("ROLE_", "").title()
+        body = [
+            f"$this->client->loginUser($this->getTestUser('{sr_fk}'), '{fw}');",
+            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
+            "self::assertResponseIsSuccessful();",
+        ]
+        # Propage les assertions sémantiques du test principal :
+        if ctx.get("has_json"):
+            body.append("$this->assertJson($this->client->getResponse()->getContent());")
+        if ctx.get("h1"):
+            body.append(f"$this->assertSelectorTextContains('h1', '{ctx['h1']}');")
+
         results.append({
             "comment":   f"{ctx['raw_route']} — {sr_fk} (rôle secondaire)",
             "func_name": f"test{ctx['cap']}IsReachedWith{sr_label}Role",
-            "body": [
-                f"$this->client->loginUser($this->getTestUser('{sr_fk}'), '{fw}');",
-                f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-                "self::assertResponseIsSuccessful();",
-            ],
+            "body":      body,
         })
     return results
 
@@ -971,6 +1068,7 @@ SCENARIO_BUILDERS = [
     _scenario_ajax_no_xhr,
     _scenario_role_insufficient,
     _scenario_voter,
+    _scenario_not_found,        # nouveau : 404 pour routes paramétrées
     _scenario_secondary_role,
 ]
 
