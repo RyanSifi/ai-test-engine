@@ -308,16 +308,21 @@ def _analyze_method_body(method_body: str) -> Dict:
     - gestion de formulaire (createForm, handleRequest, isSubmitted)
     - contrôle d'accès dynamique (denyAccessUnlessGranted + sujet)
     - template rendu
+    - verbe HTTP inféré du body (lectures de POST data, isMethod, etc.)
 
     Retourne un dict de métadonnées.
     """
     result = {
-        "rendered_template": None,
-        "response_types":    [],
-        "is_ajax_only":      False,
-        "has_form":          False,
-        "form_type":         None,
-        "voter_checks":      [],
+        "rendered_template":  None,
+        "response_types":     [],
+        "is_ajax_only":       False,
+        "has_form":           False,
+        "form_type":          None,
+        "voter_checks":       [],
+        # Nouveau : verbe HTTP inféré du body, None si rien de spécifique
+        "body_inferred_verb": None,
+        # Nouveau : type de données lues dans le body (utile pour la doc générée)
+        "body_reads": [],
     }
 
     # Template rendu
@@ -369,6 +374,30 @@ def _analyze_method_body(method_body: str) -> Dict:
             "attribute": attribute,
             "subject":   subject_m.group(1) if subject_m else None,
         })
+
+    # ── Inférence du verbe HTTP par analyse du body ─────────────────────
+    # Indices fortes (par priorité décroissante)
+    if re.search(r"\$request->isMethod\(\s*['\"]POST['\"]\s*\)", method_body, re.I):
+        result["body_inferred_verb"] = "POST"
+    elif re.search(r"\$request->isMethod\(\s*['\"]DELETE['\"]\s*\)", method_body, re.I):
+        result["body_inferred_verb"] = "DELETE"
+    elif re.search(r"\$request->isMethod\(\s*['\"]PUT['\"]\s*\)", method_body, re.I):
+        result["body_inferred_verb"] = "PUT"
+    elif re.search(r"\$request->request->(?:get|all|has)\(", method_body):
+        # Lit explicitement le body POST
+        result["body_inferred_verb"] = "POST"
+        result["body_reads"].append("POST data")
+    elif result["has_form"]:
+        # createForm + handleRequest → typiquement GET (affichage) + POST (soumission)
+        result["body_inferred_verb"] = "POST"
+
+    if re.search(r"\$request->query->(?:get|all|has)\(", method_body):
+        result["body_reads"].append("query string")
+    if re.search(r"\$request->files->(?:get|all|has)\(", method_body):
+        result["body_reads"].append("uploaded files")
+        # Upload de fichiers → quasi-toujours POST
+        if not result["body_inferred_verb"]:
+            result["body_inferred_verb"] = "POST"
 
     return result
 

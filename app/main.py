@@ -607,13 +607,19 @@ def _infer_http_verb_from_name(method_name: str, route_path: str) -> Optional[st
     return None
 
 
+_RE_BODY_INFERRED_VERB = re.compile(r"→ Verbe HTTP inféré \(body\):\s*([A-Z]+)")
+
+
 def _infer_http_verb_from_body(content: str) -> Optional[str]:
     """
-    Infère un verbe POST si le body de la méthode contient des marqueurs typiques
-    (formulaire soumis, lecture du body de requête).
-    Le « body » est ici le résumé du chunk RAG, donc on cherche les marqueurs
-    indirects laissés par le parser : Formulaire détecté, etc.
+    Récupère le verbe HTTP inféré par l'analyse profonde du body au moment de
+    l'indexation (cf. code_parser._analyze_method_body : isMethod, $request->request,
+    upload de fichiers, formulaire détecté).
     """
+    m = _RE_BODY_INFERRED_VERB.search(content)
+    if m:
+        return m.group(1).strip()
+    # Fallback sur le marqueur Formulaire (compat ancien index)
     if "Formulaire:" in content or "→ Formulaire" in content:
         return "POST"
     return None
@@ -745,6 +751,114 @@ def _generate_php_test_from_chunks(
         f"\n{body}\n"
         "}\n"
     )
+    return php
+
+
+# ── Squelette de DataFixtures ────────────────────────────────────────────────
+
+# Types à exclure (frameworks, services, etc. — pas des entités métier à mocker)
+_NON_ENTITY_TYPES = {
+    "Request", "Response", "Session", "ContainerInterface",
+    "EntityManagerInterface", "EntityManager", "ManagerRegistry",
+    "FormFactoryInterface", "RouterInterface", "TranslatorInterface",
+    "LoggerInterface", "EventDispatcherInterface", "ParameterBagInterface",
+    "DataTableQuery", "Security", "TokenStorageInterface",
+    "AuthorizationCheckerInterface", "FormView", "FormBuilderInterface",
+    "string", "int", "float", "bool", "array", "object", "mixed",
+    "Yaml", "AbstractController",
+}
+
+_RE_PARAMS_LINE = re.compile(r"Params:\s*\(([^)]*)\)")
+
+
+def _extract_entity_types_from_chunks(chunks: List[Dict]) -> List[str]:
+    """
+    Récupère les types d'entités potentiels apparaissant dans les paramètres
+    de méthode des chunks (ex : 'Creance', 'CreanceRegroupee').
+    Filtre les types techniques (Request, EntityManager, etc.).
+    """
+    found: Dict[str, int] = {}
+    for c in chunks:
+        content = c.get("content", "")
+        for params_match in _RE_PARAMS_LINE.finditer(content):
+            params_blob = params_match.group(1)
+            # Chaque paramètre : "Type $name"
+            for part in params_blob.split(","):
+                tokens = part.strip().split()
+                if len(tokens) < 2:
+                    continue
+                # Premier token = type (peut être "?Type")
+                t = tokens[0].lstrip("?\\")
+                if not t or not t[0].isupper():
+                    continue
+                if t in _NON_ENTITY_TYPES:
+                    continue
+                if t.endswith("Service") or t.endswith("Manager") or t.endswith("Repository"):
+                    continue
+                if t.endswith("Type"):  # FormType
+                    continue
+                found[t] = found.get(t, 0) + 1
+    # Trier par fréquence décroissante
+    return sorted(found.keys(), key=lambda k: (-found[k], k))
+
+
+def _generate_fixtures_skeleton(
+    entity_types: List[str],
+    test_class_name: str,
+) -> str:
+    """
+    Génère un squelette PHP DataFixtures à compléter manuellement par la MOA.
+    Crée une entité minimale par type détecté, à id=1 (valeur par défaut des tests).
+    """
+    if not entity_types:
+        return ""
+
+    use_lines = "\n".join(f"// use App\\Entity\\{t};" for t in entity_types)
+    todos = []
+    for t in entity_types:
+        var = t[0].lower() + t[1:]
+        todos.append(
+            f"        // TODO: créer une instance de {t} pour les tests\n"
+            f"        // ${var} = new {t}();\n"
+            f"        // $manager->persist(${var});\n"
+            f"        // $this->addReference('{t.lower()}_test_1', ${var});"
+        )
+    todos_block = "\n\n".join(todos)
+
+    fixtures_class_name = test_class_name + "Fixtures"
+    php = f"""<?php
+
+namespace App\\Tests\\Functional\\Fixtures;
+
+{use_lines}
+use Doctrine\\Bundle\\FixturesBundle\\Fixture;
+use Doctrine\\Persistence\\ObjectManager;
+
+/**
+ * Fixtures squelette auto-générées pour {test_class_name}.
+ *
+ * À COMPLÉTER : décommente les stubs ci-dessous et ajuste les setters
+ * aux contraintes de ton domaine. Les tests utilisent par défaut id=1
+ * pour les paramètres de route.
+ *
+ * Activation dans config/packages/test/doctrine.yaml :
+ *   doctrine:
+ *     dbal:
+ *       url: 'sqlite:///:memory:'
+ *
+ * Chargement avant chaque test :
+ *   php bin/console doctrine:fixtures:load --env=test --no-interaction
+ */
+final class {fixtures_class_name} extends Fixture
+{{
+    public function load(ObjectManager $manager): void
+    {{
+{todos_block}
+
+        $manager->flush();
+    }}
+}}
+"""
     return php
 
 
@@ -971,22 +1085,46 @@ def _scenario_role_insufficient(ctx, fw, _rp, _rc, _sec_roles):
 
 
 def _scenario_voter(ctx, fw, _rp, _rc, _sec_roles):
-    """Voter sur entité — tester l'accès refusé."""
+    """
+    Voter sur entité — tester l'accès refusé avec un ID inexistant.
+    Si la route n'a pas de paramètre, on teste juste l'accès courant.
+    """
     if not ctx["has_voter"]:
         return []
     fk = ctx["factory_key"]
     rl = ctx["role_label"]
+    voter_attr = ctx.get("voter_attr") or "?"
+
+    # Si la route est paramétrée, on cible une entité inexistante (99999999)
+    # → le voter ne peut pas accorder l'accès (entité=null) ou throw 404.
+    if "{" in ctx["raw_route"]:
+        bogus = re.sub(r"\{[^}]+\}", "99999999", ctx["raw_route"])
+        return [{
+            "comment":   f"{ctx['raw_route']} — voter '{voter_attr}' avec entité inexistante",
+            "func_name": f"test{ctx['cap']}VoterDeniesAccessWith{rl}Role",
+            "body": [
+                f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
+                f"// Voter '{voter_attr}' attendu sur cette route — entité 99999999 inexistante.",
+                f"$this->client->request('{ctx['http_verb']}', '{bogus}');",
+                "self::assertContains(",
+                "    $this->client->getResponse()->getStatusCode(),",
+                "    [403, 404, 500],",
+                f"    \"Le voter '{voter_attr}' devrait refuser ou l'entité ne devrait pas exister\"",
+                ");",
+            ],
+        }]
+    # Pas de paramètre dans la route → on teste l'accès brut
     return [{
-        "comment":   f"{ctx['raw_route']} — voter '{ctx['voter_attr']}' — accès entité",
-        "func_name": f"test{ctx['cap']}VoterDeniesAccessWith{rl}Role",
+        "comment":   f"{ctx['raw_route']} — voter '{voter_attr}' — accès courant",
+        "func_name": f"test{ctx['cap']}VoterCheckWith{rl}Role",
         "body": [
             f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-            "// ID inexistant ou entité interdite → adapter selon les fixtures",
+            f"// Voter '{voter_attr}' attendu — adapter selon les fixtures",
             f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
             "self::assertContains(",
             "    $this->client->getResponse()->getStatusCode(),",
-            "    [403, 404],",
-            "    'Le voter devrait refuser ou l\\'entité ne devrait pas exister'",
+            "    [200, 302, 403],",
+            f"    \"Voter '{voter_attr}' à valider\"",
             ");",
         ],
     }]
@@ -1320,6 +1458,12 @@ def learn_from_code(
                             form_type = method.get("form_type") or "?"
                             info += f"\n  → Formulaire: {form_type}"
 
+                        # Verbe HTTP inféré du body (lit POST data, isMethod, upload…)
+                        if method.get("body_inferred_verb"):
+                            info += f"\n  → Verbe HTTP inféré (body): {method['body_inferred_verb']}"
+                        if method.get("body_reads"):
+                            info += f"\n  → Lit: {', '.join(method['body_reads'])}"
+
                         # Voter checks
                         for vc in method.get("voter_checks", []):
                             info += f"\n  → Voter: denyAccessUnlessGranted('{vc['attribute']}'"
@@ -1479,12 +1623,25 @@ def generate_test(
         )
         _write_php_file(rel_path, code)
         logging.info(f"[generate-test] Fichier généré (déterministe) : {rel_path}")
+
+        # Génère aussi un squelette de DataFixtures (TODO à compléter par la MOA)
+        entity_types = _extract_entity_types_from_chunks(context_chunks)
+        fixtures_path = None
+        if entity_types:
+            fixtures_code = _generate_fixtures_skeleton(entity_types, safe_name)
+            fixtures_filename = f"{safe_name}Fixtures.php"
+            fixtures_path = f"tests/Functional/Fixtures/{fixtures_filename}"
+            _write_php_file(fixtures_path, fixtures_code)
+            logging.info(f"[generate-test] Fixtures squelette : {fixtures_path}")
+
         return {
             "status":             "success",
             "mode":               "deterministic",
             "controller_profile": controller_profile,
             "file":               filename,
             "path":               rel_path,
+            "fixtures_path":      fixtures_path,
+            "entities_detected":  entity_types,
             "context_used":       _build_context_str(context_chunks),
             "time_sec":           round(time.time() - start_time, 2),
         }
