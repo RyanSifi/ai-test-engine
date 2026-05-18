@@ -20,7 +20,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# ── Configuration ───────────────────────────────────────────────────────────
+# Configuration
 ROOT = Path(__file__).parent
 MODEL_PATH = ROOT / "models" / "best_model.pkl"
 FEATURES_PATH = ROOT / "models" / "feature_names.json"
@@ -31,7 +31,7 @@ TEST_ENGINE_URL = os.environ.get("TEST_ENGINE_URL", "http://localhost:8000")
 TEST_ENGINE_API_KEY = os.environ.get("TEST_ENGINE_API_KEY", "")
 
 
-# ── Cache resources ─────────────────────────────────────────────────────────
+# Cache resources
 @st.cache_resource
 def load_model():
     if not MODEL_PATH.exists():
@@ -73,14 +73,13 @@ def predict(df: pd.DataFrame, model, features) -> pd.DataFrame:
     return df
 
 
-# ── Setup page ──────────────────────────────────────────────────────────────
+# Setup page
 st.set_page_config(
     page_title="AI Test Engine — Risk Predictor",
-    page_icon="🎯",
     layout="wide",
 )
 
-st.title("🎯 AI Test Engine — Risk Predictor")
+st.title(" AI Test Engine — Risk Predictor")
 st.caption(
     "Prédicteur de risque de régression par méthode de controller Symfony. "
     "Permet à la MOA de prioriser les tests fonctionnels lors d'un changement de version."
@@ -95,17 +94,17 @@ if model is None:
     )
     st.stop()
 
-# ── Sidebar : navigation ────────────────────────────────────────────────────
+# Sidebar : navigation
 page = st.sidebar.radio(
     "Pages",
-    ["🎯 Prédiction de risque", "📊 Performance du modèle", "ℹ️ À propos"],
+    ["Prédiction de risque", "Performance du modèle", "À propos"],
 )
 
 # ============================================================================
 # PAGE 1 : PRÉDICTION DE RISQUE
 # ============================================================================
-if page == "🎯 Prédiction de risque":
-    st.header("1. Choix du dataset")
+if page == "Prédiction de risque":
+    st.header("Choix du dataset")
 
     col1, col2 = st.columns([1, 2])
     with col1:
@@ -133,10 +132,10 @@ if page == "🎯 Prédiction de risque":
 
     # Prédiction
     df = predict(df.copy(), model, FEATURES)
-    st.success(f"✅ Prédictions calculées sur {len(df)} méthodes")
+    st.success(f"Prédictions calculées sur {len(df)} méthodes")
 
-    # ── Statistiques globales ──────────────────────────────────────────────
-    st.header("2. Vue d'ensemble")
+    # Statistiques globales
+    st.header("Vue d'ensemble")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Méthodes analysées", len(df))
     c2.metric("Risque haut (≥0.5)", int(df["risk_pred"].sum()),
@@ -154,8 +153,8 @@ if page == "🎯 Prédiction de risque":
     ax.legend()
     st.pyplot(fig)
 
-    # ── Top routes à tester ────────────────────────────────────────────────
-    st.header("3. 🚨 Routes prioritaires à tester")
+    # Top routes à tester
+    st.header("Routes prioritaires à tester")
     st.caption(
         "Triées par score de risque décroissant. La MOA doit tester ces méthodes "
         "en priorité lors du passage à la version suivante."
@@ -170,7 +169,7 @@ if page == "🎯 Prédiction de risque":
     st.dataframe(top, use_container_width=True, hide_index=True)
 
     # ── Actions vers le AI Test Engine ─────────────────────────────────────
-    st.header("4. ⚡ Génération de tests prioritaires")
+    st.header("Génération de tests prioritaires")
     st.caption(
         "Pour les classes les plus à risque, on déclenche le générateur de tests "
         "fonctionnels (mode déterministe — pas d'appel LLM)."
@@ -198,7 +197,7 @@ if page == "🎯 Prédiction de risque":
             for c in risky_classes[:n_classes]:
                 st.write(f"- `{c}`")
 
-        if st.button("🚀 Générer les tests"):
+        if st.button("Générer les tests"):
             engine_ok = False
             try:
                 r = requests.get(f"{TEST_ENGINE_URL}/health", timeout=3)
@@ -247,12 +246,12 @@ if page == "🎯 Prédiction de risque":
                             "file": "—", "path": str(e)[:80],
                         })
                 progress.empty()
-                st.success(f"✅ {len(results)} générations lancées")
+                st.success(f"{len(results)} générations lancées")
                 st.dataframe(pd.DataFrame(results), use_container_width=True,
                              hide_index=True)
 
     # ── Distribution par classe ────────────────────────────────────────────
-    with st.expander("📈 Risque moyen par classe"):
+    with st.expander("Risque moyen par classe"):
         per_class = (
             df.groupby("class")
             .agg(nb_methods=("method", "count"),
@@ -270,7 +269,7 @@ if page == "🎯 Prédiction de risque":
 # ============================================================================
 # PAGE 2 : PERFORMANCE DU MODÈLE
 # ============================================================================
-elif page == "📊 Performance du modèle":
+elif page == "Performance du modèle":
     st.header("Métriques sur le jeu de test")
     metrics = load_metrics()
     if metrics is None:
@@ -278,13 +277,23 @@ elif page == "📊 Performance du modèle":
         st.stop()
 
     df_metrics = pd.DataFrame(metrics["all"]).set_index("model")
-    df_metrics = df_metrics[["accuracy", "f1", "auc"]].applymap(
+    # Colonnes disponibles selon la version du train.py
+    display_cols = [c for c in ["train_f1", "test_f1", "cv_test_f1_mean",
+                                "accuracy", "auc", "overfit_gap"]
+                    if c in df_metrics.columns]
+    if not display_cols:
+        display_cols = [c for c in ["accuracy", "f1", "auc"] if c in df_metrics.columns]
+    df_metrics = df_metrics[display_cols].map(
         lambda v: f"{v:.4f}" if isinstance(v, (int, float)) else v
     )
     st.dataframe(df_metrics, use_container_width=True)
 
     best = metrics["best"]
-    st.success(f"🏆 Meilleur modèle : **{best['model']}** (F1 = {best['f1']:.4f})")
+    cv_f1 = best.get("cv_test_f1_mean", best.get("f1", 0))
+    st.success(f"Meilleur modèle : **{best['model']}** (CV F1 = {cv_f1:.4f})")
+    if best.get("overfit_gap", 0) > 0.1:
+        st.warning(f"Gap overfitting : {best['overfit_gap']:.4f} — "
+                   "le modèle pourrait ne pas généraliser.")
 
     st.header("Importance des features")
     importance = load_importance()

@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 from code_parser import _parse_file_content, _read_php_file  # noqa: E402
 
 
-# ── Patterns commits "bugfix" ────────────────────────────────────────────────
+# Patterns commits "bugfix"
 BUGFIX_PATTERNS = [
     r"^\s*\[?(?:fix|bugfix|hotfix|patch|correctif)",
     r"^\s*fixes?\s*[:#]",
@@ -83,7 +83,6 @@ def list_controllers(repo_path: str) -> List[str]:
             parts = root.replace("\\", "/").split("/")
             if "Controller" in parts or "Action" in parts:
                 controllers.append(os.path.join(root, f))
-    # Dédup
     return sorted(set(controllers))
 
 
@@ -222,7 +221,7 @@ def extract_features(file_path: str, repo_path: str, since: str,
             "git_nb_authors": git_metrics["nb_authors"],
             "git_days_since_change": git_metrics["days_since_change"],
 
-            # ── LABEL ───────────────────────────────────────────────────
+            # LABEL
             # 1 = à risque (≥ threshold bugfix dans la fenêtre)
             "label_risk": int(git_metrics["bugfix_count"] >= bugfix_threshold),
         }
@@ -248,17 +247,17 @@ def main():
 
     repo_path = os.path.abspath(args.repo_path)
     if not os.path.isdir(os.path.join(repo_path, ".git")):
-        sys.exit(f"❌ {repo_path} n'est pas un repo git.")
+        sys.exit(f"{repo_path} n'est pas un repo git.")
 
-    print(f"📂 Repo : {repo_path}")
-    print(f"📅 Fenêtre git : {args.since}")
-    print(f"🎯 Seuil bugfix pour label_risk=1 : ≥ {args.bugfix_threshold}")
+    print(f"Repo : {repo_path}")
+    print(f"Fenêtre git : {args.since}")
+    print(f"Seuil bugfix pour label_risk=1 : ≥ {args.bugfix_threshold}")
     print()
 
     controllers = list_controllers(repo_path)
     print(f"Trouvé {len(controllers)} fichiers Controller.php")
     if not controllers:
-        sys.exit("❌ Aucun controller trouvé.")
+        sys.exit("Aucun controller trouvé.")
 
     all_rows = []
     t0 = time.time()
@@ -270,7 +269,7 @@ def main():
         all_rows.extend(rows)
 
     if not all_rows:
-        sys.exit("❌ Aucune ligne extraite (pas de routes trouvées dans les controllers ?).")
+        sys.exit("Aucune ligne extraite (pas de routes trouvées dans les controllers ?).")
 
     fieldnames = list(all_rows[0].keys())
     with open(args.output, "w", encoding="utf-8", newline="") as f:
@@ -280,7 +279,7 @@ def main():
 
     n_pos = sum(1 for r in all_rows if r["label_risk"] == 1)
     elapsed = time.time() - t0
-    print(f"\n✅ {len(all_rows)} lignes écrites → {args.output}  ({elapsed:.1f}s)")
+    print(f"\n {len(all_rows)} lignes écrites → {args.output}  ({elapsed:.1f}s)")
     print(f"   label_risk=1 : {n_pos:>4}  ({100 * n_pos / len(all_rows):.1f}%)")
     print(f"   label_risk=0 : {len(all_rows) - n_pos:>4}")
     print(f"   Features     : {len(fieldnames) - 7} (hors identifiants et label)")
