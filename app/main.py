@@ -131,11 +131,15 @@ _PROJECT_ID_PATTERN = r"^[a-zA-Z0-9_.-]+$"
 
 class LearnFromCodeRequest(BaseModel):
     project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    model_name: Optional[str] = Field(default=None, max_length=200)
+    model_name: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        json_schema_extra={"examples": [settings.default_embedding_model]},
+    )
     model_config = {"protected_namespaces": ()}
 
     def model_post_init(self, __ctx) -> None:
-        if not self.model_name:
+        if not self.model_name or self.model_name == "string":
             self.model_name = settings.default_embedding_model
 
 
@@ -633,7 +637,7 @@ def _extract_http_verb(content: str, method_name: str = "", route_path: str = ""
       3. Heuristique sur le nom de méthode (delete*, update*, etc.) ou la route
       4. GET par défaut
     """
-    # 1. Verbe explicite
+    # Verbe explicite
     m = _RE_HTTP_VERBS.search(content)
     if m:
         verbs = [v.strip() for v in m.group(1).split(",") if v.strip()]
@@ -644,12 +648,12 @@ def _extract_http_verb(content: str, method_name: str = "", route_path: str = ""
         if verbs:
             return verbs[0]
 
-    # 2. Indices dans le body
+    # Indices dans le body
     inferred = _infer_http_verb_from_body(content)
     if inferred:
         return inferred
 
-    # 3. Heuristique nom + route
+    # Heuristique nom + route
     inferred = _infer_http_verb_from_name(method_name, route_path)
     if inferred:
         return inferred
@@ -754,7 +758,7 @@ def _generate_php_test_from_chunks(
     return php
 
 
-# ── Squelette de DataFixtures ────────────────────────────────────────────────
+# Squelette de DataFixtures
 
 # Types à exclure (frameworks, services, etc. — pas des entités métier à mocker)
 _NON_ENTITY_TYPES = {
@@ -1206,7 +1210,7 @@ SCENARIO_BUILDERS = [
     _scenario_ajax_no_xhr,
     _scenario_role_insufficient,
     _scenario_voter,
-    _scenario_not_found,        # nouveau : 404 pour routes paramétrées
+    _scenario_not_found,
     _scenario_secondary_role,
 ]
 

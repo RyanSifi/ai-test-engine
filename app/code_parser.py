@@ -319,9 +319,7 @@ def _analyze_method_body(method_body: str) -> Dict:
         "has_form":           False,
         "form_type":          None,
         "voter_checks":       [],
-        # Nouveau : verbe HTTP inféré du body, None si rien de spécifique
         "body_inferred_verb": None,
-        # Nouveau : type de données lues dans le body (utile pour la doc générée)
         "body_reads": [],
     }
 
@@ -375,7 +373,7 @@ def _analyze_method_body(method_body: str) -> Dict:
             "subject":   subject_m.group(1) if subject_m else None,
         })
 
-    # ── Inférence du verbe HTTP par analyse du body ─────────────────────
+    # Inférence du verbe HTTP par analyse du body
     # Indices fortes (par priorité décroissante)
     if re.search(r"\$request->isMethod\(\s*['\"]POST['\"]\s*\)", method_body, re.I):
         result["body_inferred_verb"] = "POST"
@@ -475,13 +473,11 @@ def _extract_params(params_str: str) -> List[Dict]:
         raw = raw.strip()
         if not raw:
             continue
-        # Retire la valeur par défaut éventuelle (= ...)
         if '=' in raw:
             raw = raw.split('=', 1)[0].strip()
         parts = raw.split()
         if not parts:
             continue
-        # Le nom du paramètre est le dernier token qui commence par '$'
         name_idx = next(
             (i for i in range(len(parts) - 1, -1, -1) if parts[i].startswith('$')),
             -1,
@@ -489,7 +485,6 @@ def _extract_params(params_str: str) -> List[Dict]:
         if name_idx == -1:
             continue
         param_name = parts[name_idx].lstrip('$')
-        # Le type, s'il y en a un, est le dernier token avant le nom (hors modifiers)
         type_tokens = [p for p in parts[:name_idx] if p not in _PARAM_MODIFIERS]
         param_type = type_tokens[-1].lstrip('?\\') if type_tokens else None
         params.append({"type": param_type, "name": param_name})
@@ -538,9 +533,9 @@ def _parse_file_content(content: str) -> Dict:
     FUNC_RE = re.compile(
         r"(?:(?:public|protected|private|final|abstract|static)\s+)*"
         r"function\s+"
-        r"([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)"  # nom
-        r"\s*\((.*?)\)"                                   # params (non-greedy, DOTALL)
-        r"(?:\s*:\s*(\??[a-zA-Z0-9_|\\\[\]&]+))?",       # retour optionnel (nullable / union / intersection)
+        r"([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)"
+        r"\s*\((.*?)\)"
+        r"(?:\s*:\s*(\??[a-zA-Z0-9_|\\\[\]&]+))?",
         re.DOTALL
     )
 
