@@ -1,0 +1,36 @@
+======================================================================
+  EDA REPORT — Résumé automatique
+======================================================================
+
+── FINDINGS ──
+  • Aucune valeur manquante dans les features
+  • Déséquilibre modéré (ratio=4.58)
+  • 'cyclomatic_complexity' ne discrimine pas significativement le label (p=0.456)
+  • 'nb_routes_method' ne discrimine pas significativement le label (p=0.288)
+  • 'nb_voter_checks' ne discrimine pas significativement le label (p=0.511)
+  • Features quasi non corrélées au label (|r| < 0.05) : has_route_attr, nb_voter_checks, has_file_download, cyclomatic_complexity
+  • 'has_render' discrimine le label : taux risque = 85.3% (=0) vs 73.5% (=1)
+  • 'has_redirect' discrimine le label : taux risque = 85.2% (=0) vs 66.7% (=1)
+  • Corrélation git_total_commits ↔ git_bugfix_count : r=0.970
+
+── WARNINGS ──
+  • 'nb_constructor_deps' a 34 outliers extrêmes (9.2%)
+  • 'nb_routes_method' a 84 outliers extrêmes (22.8%)
+  • 'nb_method_grants' a 49 outliers extrêmes (13.3%)
+  • 'nb_class_grants' a 150 outliers extrêmes (40.8%)
+  • Forte corrélation entre 'nb_routes_method' et 'has_route_attr' (r=0.864) — envisager d'en retirer une
+  • Forte corrélation entre 'is_ajax_only' et 'has_json' (r=0.850) — envisager d'en retirer une
+  • Forte corrélation entre 'nb_class_grants' et 'nb_methods_in_class' (r=0.814) — envisager d'en retirer une
+  • Forte corrélation entre 'nb_class_grants' et 'file_loc' (r=0.800) — envisager d'en retirer une
+  • Forte corrélation entre 'nb_methods_in_class' et 'file_loc' (r=0.983) — envisager d'en retirer une
+  • Forte corrélation entre 'method_loc' et 'cyclomatic_complexity' (r=0.893) — envisager d'en retirer une
+  • 'is_invoke' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'nb_voter_checks' est quasi-constante (99.5% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_file_download' est quasi-constante (96.7% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • Corrélation forte git_total_commits ↔ git_bugfix_count (r=0.970) — confirme le leakage partiel. Bon choix de l'exclure par défaut dans train.py
+  • VIF > 10 (multicolinéarité forte) : has_file_download, has_json, has_redirect, has_render, nb_response_types, is_invoke, file_loc, nb_methods_in_class. Impact faible sur RF/XGB, mais dégrade la LogisticRegression.
+
+── RECOMMENDATIONS ──
+  • Après cet EDA, relancer train.py et comparer les métriques avec/sans les features flaggées (quasi-constantes, non significatives)
+  • Pipeline recommandé : extract_dataset.py → eda.py (ce script) → ajustements features → train.py → streamlit_app.py
+

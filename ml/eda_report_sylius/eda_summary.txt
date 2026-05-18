@@ -1,0 +1,41 @@
+======================================================================
+  EDA REPORT — Résumé automatique
+======================================================================
+
+── FINDINGS ──
+  • Aucune valeur manquante dans les features
+  • Déséquilibre modéré (ratio=0.36)
+  • 'cyclomatic_complexity' ne discrimine pas significativement le label (p=0.090)
+  • 'nb_params' ne discrimine pas significativement le label (p=0.167)
+  • 'nb_routes_method' ne discrimine pas significativement le label (p=1.000)
+  • 'nb_voter_checks' ne discrimine pas significativement le label (p=1.000)
+  • 'nb_response_types' ne discrimine pas significativement le label (p=0.066)
+  • 'nb_method_grants' ne discrimine pas significativement le label (p=1.000)
+  • 'nb_class_grants' ne discrimine pas significativement le label (p=1.000)
+  • Features quasi non corrélées au label (|r| < 0.05) : nb_constructor_deps, has_render, is_invoke
+  • 'has_redirect' discrimine le label : taux risque = 22.4% (=0) vs 48.1% (=1)
+  • Corrélation git_total_commits ↔ git_bugfix_count : r=0.753
+
+── WARNINGS ──
+  • 'file_loc' a 14 outliers extrêmes (7.7%)
+  • 'nb_response_types' a 36 outliers extrêmes (19.7%)
+  • Forte corrélation entre 'nb_response_types' et 'has_redirect' (r=0.837) — envisager d'en retirer une
+  • Forte corrélation entre 'nb_methods_in_class' et 'file_loc' (r=0.901) — envisager d'en retirer une
+  • 'nb_routes_method' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_route_attr' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'is_ajax_only' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'nb_class_grants' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'nb_voter_checks' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'nb_method_grants' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_file_download' est quasi-constante (100.0% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_render' est quasi-constante (96.7% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_form' est quasi-constante (95.6% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • 'has_json' est quasi-constante (95.6% = 0.0) — apporte très peu de signal, candidat à l'exclusion
+  • Corrélation forte git_total_commits ↔ git_bugfix_count (r=0.753) — confirme le leakage partiel. Bon choix de l'exclure par défaut dans train.py
+  • VIF > 10 (multicolinéarité forte) : nb_routes_method, has_route_attr, is_ajax_only, nb_response_types, nb_voter_checks, has_json, has_file_download, has_render, has_redirect, nb_method_grants, nb_class_grants. Impact faible sur RF/XGB, mais dégrade la LogisticRegression.
+
+── RECOMMENDATIONS ──
+  • Dataset petit (183 lignes pour 21 features, ratio=9). Risque d'overfitting élevé — la RepeatedStratifiedKFold dans train.py est un bon choix.
+  • Après cet EDA, relancer train.py et comparer les métriques avec/sans les features flaggées (quasi-constantes, non significatives)
+  • Pipeline recommandé : extract_dataset.py → eda.py (ce script) → ajustements features → train.py → streamlit_app.py
+
