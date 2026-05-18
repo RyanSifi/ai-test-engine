@@ -42,6 +42,8 @@ services:
       - ..:/workspace:rw
       # Hot-reload : modifier app/*.py sans reconstruire l'image
       - ./app:/app
+      - "../:/mnt/sucre:ro"
+      - "./ml:/app/ml:ro"
     environment:
       DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
       OLLAMA_URL:               http://host.docker.internal:11434/api/generate
@@ -65,6 +67,29 @@ services:
       timeout:  10s
       retries:  3
       start_period: 60s   # Laisser le temps au modele d'embedding de se charger
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. INTERFACE STREAMLIT
+  # ──────────────────────────────────────────────────────────────────────────
+  streamlit-ui:
+    build: ./ml
+    container_name: ai_streamlit_ui
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ..:/workspace:rw
+      - ./ml:/app
+      - "./_dataset:/app/_dataset:ro"
+    environment:
+      DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
+      OLLAMA_URL:               http://host.docker.internal:11434/api/generate
+    depends_on:
+      - brain-api
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - internal_ai
 
 # ──────────────────────────────────────────────────────────────────────────
 # RESEAU
