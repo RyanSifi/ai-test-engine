@@ -1,11 +1,9 @@
 fastapi==0.109.0
 uvicorn==0.27.0
 psycopg2-binary==2.9.9
-# all-mpnet-base-v2 (Priorité 4) nécessite sentence-transformers >= 2.6
 sentence-transformers==2.6.1
 pydantic==2.6.0
 pydantic-settings==2.1.0
 requests==2.31.0
-# Tests : conservés ici car pas de pipeline CI séparé pour l'instant
 pytest==8.0.0
 httpx==0.26.0

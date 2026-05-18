@@ -74,10 +74,9 @@ class KnowledgeDB:
         """
         Supprime et recrée la table principale.
         À utiliser uniquement lors d'un changement de modèle d'embedding.
-        ⚠️  Toutes les données sont perdues.
+        Attention toutes les données sont perdues.
         """
         with self._cursor() as cur:
-            # Drop des anciennes tables legacy (peuvent exister sur d'anciennes installations)
             cur.execute("DROP TABLE IF EXISTS routes CASCADE;")
             cur.execute("DROP TABLE IF EXISTS scenarios CASCADE;")
             cur.execute("DROP TABLE IF EXISTS project_code_context CASCADE;")
