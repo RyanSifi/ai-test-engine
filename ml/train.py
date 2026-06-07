@@ -260,10 +260,10 @@ def main():
     ap.add_argument("--include-total-commits", action="store_true",
                     help="Inclure git_total_commits dans les features "
                          "(leakage partiel, pour comparaison)")
-    ap.add_argument("--feature-set", choices=["v1", "v2", "v3"], default="v3",
+    ap.add_argument("--feature-set", choices=["v1", "v2", "v3"], default="v2",
                     help="v1 = toutes les features safe, "
-                         "v2 = nettoyées post-EDA, "
-                         "v3 = structure pure sans features git de fenêtre (défaut, leak-free)")
+                         "v2 = nettoyées post-EDA (défaut, validé sur SUCRE + Sylius), "
+                         "v3 = structure pure sans features git de fenêtre (leak-free mais signal réduit)")
     ap.add_argument("--compare", action="store_true",
                     help="Entraîne avec v1 ET v2 et compare les résultats")
     args = ap.parse_args()
