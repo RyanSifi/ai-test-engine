@@ -74,6 +74,22 @@ def get_brain(model_name: str) -> SemanticEngine:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.info("Démarrage de l'application.")
+
+    # ── Avertissements de configuration ──────────────────────────────────────
+    if not settings.api_key:
+        logging.warning(
+            "API_KEY non défini — tous les endpoints d'écriture sont accessibles "
+            "sans authentification. Définir API_KEY dans docker-compose.yml (ou .env) "
+            "avant tout déploiement en production."
+        )
+    else:
+        logging.info("API_KEY configuré — authentification activée sur les endpoints d'écriture.")
+
+    if not settings.cors_origins:
+        logging.info("CORS_ORIGINS vide — middleware CORS désactivé (mode dev).")
+    else:
+        logging.info(f"CORS activé pour : {settings.cors_origins}")
+
     db = get_db()
     brain = get_brain(settings.default_embedding_model)
     # Initialise le schéma si les tables n'existent pas encore
@@ -2042,6 +2058,8 @@ def job_status(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' introuvable ou expiré (TTL 2h).")
     # On n'expose pas le timestamp interne
     job.pop("ts", None)
+    # On s'assure que job_id est toujours dans la réponse (pratique côté client)
+    job.setdefault("job_id", job_id)
     return job
 
 
@@ -2049,7 +2067,7 @@ def job_status(job_id: str):
 
 class GenerateTestsBatchRequest(BaseModel):
     project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    class_names: List[str] = Field(..., min_items=1, max_items=50)
+    class_names: List[str] = Field(..., min_length=1, max_length=50)
     deterministic: bool = True   # Défaut déterministe pour le lot (plus rapide, zéro hallucination)
     description_prefix: str = Field(
         default="Tests fonctionnels pour",
