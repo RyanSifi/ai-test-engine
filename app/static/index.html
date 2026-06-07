@@ -283,6 +283,14 @@
     <a onclick="show('gen-unit')" id="nav-gen-unit">
       Test unitaire <span class="badge badge-post">POST</span>
     </a>
+    <a onclick="show('batch')" id="nav-batch">
+      Batch génération <span class="badge badge-post">POST</span>
+    </a>
+
+    <div class="section-label">Jobs</div>
+    <a onclick="show('job-status')" id="nav-job-status">
+      Statut job <span class="badge badge-get">GET</span>
+    </a>
 
     <div class="section-label">Admin</div>
     <a onclick="show('reset')" id="nav-reset">
@@ -309,7 +317,7 @@
         <div class="label">Projets indexés</div>
       </div>
       <div class="stat-card">
-        <div class="value">7</div>
+        <div class="value">10</div>
         <div class="label">Endpoints</div>
       </div>
       <div class="stat-card">
@@ -345,6 +353,14 @@
       <div class="endpoint-item" onclick="show('reset')">
         <span class="method-tag post">POST</span>
         <div><div class="path">/admin/reset-schema</div><div class="desc">Réinitialiser toute la base de données</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('batch')">
+        <span class="method-tag post">POST</span>
+        <div><div class="path">/generate-tests-batch</div><div class="desc">Générer plusieurs tests en batch (async)</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('job-status')">
+        <span class="method-tag get">GET</span>
+        <div><div class="path">/job/{job_id}/status</div><div class="desc">Consulter l'état d'un job asynchrone</div></div>
       </div>
     </div>
   </div>
@@ -432,14 +448,33 @@
         <input type="text" id="gf-model" placeholder="qwen2.5-coder:7b"/>
       </div>
     </div>
-    <div class="form-group">
-      <label class="checkbox-row">
-        <input type="checkbox" id="gf-det"/>
-        Mode déterministe (sans LLM — template fixe)
-      </label>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="gf-det"/>
+          Mode déterministe (sans LLM)
+        </label>
+      </div>
+      <div class="form-group">
+        <label class="checkbox-row">
+          <input type="checkbox" id="gf-async" checked/>
+          Mode asynchrone (non-bloquant)
+        </label>
+      </div>
     </div>
     <button class="btn btn-primary" onclick="runGenFunc()">Générer le test</button>
     <div id="res-gen-func"></div>
+    <div id="job-poll-func" style="display:none; margin-top:18px;">
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
+        <div style="font-size:.85rem;color:var(--muted);margin-bottom:10px;">Job en cours</div>
+        <div style="font-family:monospace;font-size:.9rem;color:#a5b4fc;" id="job-id-func">—</div>
+        <div style="margin-top:12px;display:flex;gap:10px;">
+          <button class="btn btn-ghost" style="padding:7px 16px;font-size:.82rem;" onclick="pollJob('func')">⟳ Actualiser</button>
+          <button class="btn btn-ghost" style="padding:7px 16px;font-size:.82rem;" onclick="cancelPoll('func')">✕ Annuler</button>
+        </div>
+        <div id="job-result-func" style="margin-top:12px;"></div>
+      </div>
+    </div>
   </div>
 
   <!-- GENERATE UNIT -->
@@ -475,12 +510,69 @@
         <input type="text" id="gu-testname" placeholder="OrderServiceTest"/>
       </div>
     </div>
-    <div class="form-group">
-      <label>model_name</label>
-      <input type="text" id="gu-model" placeholder="qwen2.5-coder:7b"/>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>model_name</label>
+        <input type="text" id="gu-model" placeholder="qwen2.5-coder:7b"/>
+      </div>
+      <div class="form-group" style="display:flex;align-items:flex-end;padding-bottom:2px;">
+        <label class="checkbox-row">
+          <input type="checkbox" id="gu-async" checked/>
+          Mode asynchrone (non-bloquant)
+        </label>
+      </div>
     </div>
     <button class="btn btn-primary" onclick="runGenUnit()">Générer le test</button>
     <div id="res-gen-unit"></div>
+    <div id="job-poll-unit" style="display:none; margin-top:18px;">
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;">
+        <div style="font-size:.85rem;color:var(--muted);margin-bottom:10px;">Job en cours</div>
+        <div style="font-family:monospace;font-size:.9rem;color:#a5b4fc;" id="job-id-unit">—</div>
+        <div style="margin-top:12px;display:flex;gap:10px;">
+          <button class="btn btn-ghost" style="padding:7px 16px;font-size:.82rem;" onclick="pollJob('unit')">⟳ Actualiser</button>
+          <button class="btn btn-ghost" style="padding:7px 16px;font-size:.82rem;" onclick="cancelPoll('unit')">✕ Annuler</button>
+        </div>
+        <div id="job-result-unit" style="margin-top:12px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- BATCH -->
+  <div class="page" id="page-batch">
+    <h2><span class="method-tag post">POST</span>/generate-tests-batch
+      <small>Génère plusieurs tests fonctionnels en parallèle en mode asynchrone.</small>
+    </h2>
+    <div style="background:rgba(79,70,229,.1);border:1px solid rgba(79,70,229,.4);border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;font-size:.875rem;">
+      Chaque ligne = un test. Format JSON d'une liste de <code>GenerateTestRequest</code>. Les jobs sont lancés en arrière-plan ; récupérez les job_ids et sondez <code>/job/{id}/status</code>.
+    </div>
+    <div class="form-group">
+      <label>Requêtes (JSON array) <span>*</span></label>
+      <textarea id="batch-body" style="min-height:180px;font-family:monospace;font-size:.82rem;">[
+  {"project_id": "sucre", "description": "Tester GET /products", "class_name": "ProductController"},
+  {"project_id": "sucre", "description": "Tester POST /orders", "class_name": "OrderController"}
+]</textarea>
+    </div>
+    <button class="btn btn-primary" onclick="runBatch()">Lancer le batch</button>
+    <div id="res-batch"></div>
+  </div>
+
+  <!-- JOB STATUS -->
+  <div class="page" id="page-job-status">
+    <h2><span class="method-tag get">GET</span>/job/{job_id}/status
+      <small>Consulte l'état d'un job asynchrone (pending / running / done / error).</small>
+    </h2>
+    <div class="form-group">
+      <label>job_id <span>*</span></label>
+      <input type="text" id="js-jobid" placeholder="a3f9b2c01d4e"/>
+    </div>
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:16px;">
+      <button class="btn btn-primary" onclick="runJobStatus()">▶ Consulter</button>
+      <label class="checkbox-row" style="margin:0;">
+        <input type="checkbox" id="js-autopoll"/>
+        Auto-poll toutes les 5 s
+      </label>
+    </div>
+    <div id="res-job-status"></div>
   </div>
 
   <!-- RESET -->
@@ -655,6 +747,49 @@
     setLoading(btn, false);
   }
 
+  // ── Job state ────────────────────────────────────────────────────────────
+  const _jobState = {};   // { func: jobId, unit: jobId }
+  let   _autoPollTimer = null;
+
+  async function pollJob(kind) {
+    const jobId = _jobState[kind];
+    if (!jobId) return;
+    try {
+      const { status, data } = await apiFetch('GET', `/job/${jobId}/status`);
+      const box = document.getElementById(`job-result-${kind}`);
+      if (status === 200) {
+        const s = data.status;
+        if (s === 'done') {
+          box.innerHTML = `<div style="color:#4ade80;font-weight:600;margin-bottom:8px;">✓ Terminé</div>`;
+          renderResponse(`res-gen-${kind === 'func' ? 'func' : 'unit'}`, 200, data.result || data, true);
+          toast('Test généré !');
+          cancelPoll(kind);
+        } else if (s === 'error') {
+          box.innerHTML = `<div style="color:#fca5a5;">✗ Erreur : ${data.error || '?'}</div>`;
+          cancelPoll(kind);
+        } else {
+          box.innerHTML = `<div style="color:var(--muted);">Statut : <strong style="color:var(--text);">${s}</strong></div>`;
+        }
+      }
+    } catch(e) { console.error('poll error', e); }
+  }
+
+  function cancelPoll(kind) {
+    delete _jobState[kind];
+    const panel = document.getElementById(`job-poll-${kind}`);
+    if (panel) panel.style.display = 'none';
+  }
+
+  function startAsyncJob(kind, jobId) {
+    _jobState[kind] = jobId;
+    document.getElementById(`job-id-${kind}`).textContent = jobId;
+    document.getElementById(`job-poll-${kind}`).style.display = 'block';
+    document.getElementById(`job-result-${kind}`).innerHTML =
+      '<div style="color:var(--muted);font-size:.82rem;">En attente… clique sur Actualiser ou patiente.</div>';
+    toast(`Job lancé : ${jobId}`, true);
+  }
+
+  // ── Generate functional ───────────────────────────────────────────────────
   async function runGenFunc() {
     const btn = event.target;
     const pid   = document.getElementById('gf-pid').value.trim();
@@ -663,20 +798,26 @@
     const tname = document.getElementById('gf-testname').value.trim();
     const model = document.getElementById('gf-model').value.trim();
     const det   = document.getElementById('gf-det').checked;
+    const async_ = document.getElementById('gf-async').checked;
     if (!pid || !desc) return toast('project_id et description sont requis', false);
     setLoading(btn, true);
-    const body = { project_id: pid, description: desc, deterministic: det };
+    const body = { project_id: pid, description: desc, deterministic: det, async_mode: async_ };
     if (cls)   body.class_name = cls;
     if (tname) body.test_name  = tname;
     if (model) body.model_name = model;
     try {
       const { status, data } = await apiFetch('POST', '/generate-test', body);
-      renderResponse('res-gen-func', status, data, true);
-      toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+      if (async_ && data.job_id) {
+        startAsyncJob('func', data.job_id);
+      } else {
+        renderResponse('res-gen-func', status, data, true);
+        toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+      }
     } catch(e) { renderResponse('res-gen-func', 0, { error: e.message }); }
     setLoading(btn, false);
   }
 
+  // ── Generate unit ─────────────────────────────────────────────────────────
   async function runGenUnit() {
     const btn = event.target;
     const pid   = document.getElementById('gu-pid').value.trim();
@@ -686,17 +827,65 @@
     const meth  = document.getElementById('gu-method').value.trim();
     const tname = document.getElementById('gu-testname').value.trim();
     const model = document.getElementById('gu-model').value.trim();
+    const async_ = document.getElementById('gu-async').checked;
     if (!pid || !cls || !file || !desc) return toast('project_id, class_name, file_path et description sont requis', false);
     setLoading(btn, true);
-    const body = { project_id: pid, class_name: cls, file_path: file, description: desc };
+    const body = { project_id: pid, class_name: cls, file_path: file, description: desc, async_mode: async_ };
     if (meth)  body.method_name = meth;
     if (tname) body.test_name   = tname;
     if (model) body.model_name  = model;
     try {
       const { status, data } = await apiFetch('POST', '/generate-unit-test', body);
-      renderResponse('res-gen-unit', status, data, true);
-      toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+      if (async_ && data.job_id) {
+        startAsyncJob('unit', data.job_id);
+      } else {
+        renderResponse('res-gen-unit', status, data, true);
+        toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+      }
     } catch(e) { renderResponse('res-gen-unit', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  // ── Job status ────────────────────────────────────────────────────────────
+  async function runJobStatus() {
+    const btn = event.target;
+    const jobId = document.getElementById('js-jobid').value.trim();
+    if (!jobId) return toast('job_id requis', false);
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('GET', `/job/${jobId}/status`);
+      renderResponse('res-job-status', status, data);
+    } catch(e) { renderResponse('res-job-status', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  // Auto-poll toggle
+  document.addEventListener('DOMContentLoaded', () => {
+    const cb = document.getElementById('js-autopoll');
+    if (cb) cb.addEventListener('change', () => {
+      if (_autoPollTimer) { clearInterval(_autoPollTimer); _autoPollTimer = null; }
+      if (cb.checked) {
+        _autoPollTimer = setInterval(() => {
+          const jobId = document.getElementById('js-jobid').value.trim();
+          if (jobId) runJobStatus();
+        }, 5000);
+      }
+    });
+  });
+
+  // ── Batch ─────────────────────────────────────────────────────────────────
+  async function runBatch() {
+    const btn = event.target;
+    let requests;
+    try { requests = JSON.parse(document.getElementById('batch-body').value); }
+    catch(e) { return toast('JSON invalide : ' + e.message, false); }
+    if (!Array.isArray(requests) || requests.length === 0) return toast('Liste vide', false);
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('POST', '/generate-tests-batch', { requests });
+      renderResponse('res-batch', status, data);
+      toast(status === 200 ? `${data.jobs?.length ?? 0} jobs lancés` : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-batch', 0, { error: e.message }); }
     setLoading(btn, false);
   }
 
