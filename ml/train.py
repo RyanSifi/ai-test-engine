@@ -50,9 +50,9 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import (
     GridSearchCV,
-    RepeatedStratifiedKFold,
+    GroupShuffleSplit,
+    StratifiedGroupKFold,
     cross_validate,
-    train_test_split,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -63,11 +63,11 @@ try:
 except ImportError:
     HAS_XGB = False
 
-# ── Colonnes du dataset ──────────────────────────────────────────────────────
+# Colonnes du dataset
 ID_COLS = ["file", "class", "method", "profile"]
 LABEL_COL = "label_risk"
 
-# ── Feature sets ─────────────────────────────────────────────────────────────
+# Feature sets
 #
 # v1 (SAFE_FEATURES) — Jeu initial, 21 features
 #   Toutes les features structurelles + git, sans leakage direct.
@@ -76,7 +76,7 @@ LABEL_COL = "label_risk"
 #     - 3 features redondantes (corrélations >0.86, VIF explosés)
 #     - Overfitting accru sur petit dataset (+50% de gap train/test)
 #
-# v2 (SAFE_FEATURES_V2) — Jeu nettoyé post-EDA, 15 features  ✅ VALIDÉ
+# v2 (SAFE_FEATURES_V2) — Jeu nettoyé post-EDA, 15 features  VALIDÉ
 #   6 features retirées, validé sur 2 projets indépendants :
 #
 #   ┌─────────────────┬────────────────────────────┬────────────────────────────┐
@@ -116,7 +116,7 @@ SAFE_FEATURES = [
     "git_nb_authors", "git_days_since_change",
 ]
 
-# v2 ✅ — Features nettoyées post-EDA (défaut)
+# v2 — Features nettoyées post-EDA (défaut)
 # Exclusions basées sur eda.py, validées sur SUCRE + Sylius :
 #   - is_invoke            : variance nulle (100% = 0 sur SUCRE, 100% sur Sylius)
 #   - nb_voter_checks      : quasi-constante (99.5% = 0 sur SUCRE, 100% sur Sylius)
@@ -133,6 +133,12 @@ EDA_DROP = [
     "cyclomatic_complexity",
 ]
 SAFE_FEATURES_V2 = [f for f in SAFE_FEATURES if f not in EDA_DROP]
+
+# v3 — Structure pure : on retire aussi les 2 dernières features git, calculées
+# sur la MÊME fenêtre de 12 mois que le label (fuite contemporaine légère).
+# Modèle sans aucune dépendance à la fenêtre du label → le plus défendable.
+GIT_WINDOW_FEATURES = ["git_nb_authors", "git_days_since_change"]
+SAFE_FEATURES_V3 = [f for f in SAFE_FEATURES_V2 if f not in GIT_WINDOW_FEATURES]
 
 # Features avec git_total_commits (leakage partiel, à comparer)
 FEATURES_WITH_COMMITS = SAFE_FEATURES + ["git_total_commits"]
@@ -196,19 +202,26 @@ def evaluate(name, model, X_train, y_train, X_test, y_test) -> dict:
     return metrics
 
 
-def cross_val_report(name, model, X, y, random_state=42):
-    """Cross-validation répétée pour des métriques fiables."""
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=random_state)
+def cross_val_report(name, model, X, y, groups, random_state=42):
+    """Cross-validation groupée par fichier : aucun fichier (ni aucune de ses
+    méthodes) ne peut être à la fois en apprentissage et en test. Évite la fuite
+    de groupe propre à une granularité méthode avec un label défini au niveau
+    fichier."""
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
     scores = cross_validate(
-        model, X, y, cv=cv,
-        scoring=["f1", "accuracy"],
+        model, X, y, groups=groups, cv=cv,
+        scoring=["f1", "accuracy", "roc_auc", "balanced_accuracy",
+                 "matthews_corrcoef"],
         return_train_score=True,
         n_jobs=-1,
     )
-    print(f"\n   Cross-validation (5-fold x 3 repeats) :")
+    print(f"\n   Cross-validation (StratifiedGroupKFold, 5 plis groupés par fichier) :")
     print(f"      train_f1 : {scores['train_f1'].mean():.4f} +/- {scores['train_f1'].std():.4f}")
     print(f"      test_f1  : {scores['test_f1'].mean():.4f} +/- {scores['test_f1'].std():.4f}")
     print(f"      test_acc : {scores['test_accuracy'].mean():.4f} +/- {scores['test_accuracy'].std():.4f}")
+    print(f"      auc      : {scores['test_roc_auc'].mean():.4f} +/- {scores['test_roc_auc'].std():.4f}")
+    print(f"      bal_acc  : {scores['test_balanced_accuracy'].mean():.4f}")
+    print(f"      mcc      : {scores['test_matthews_corrcoef'].mean():.4f}")
     gap = scores['train_f1'].mean() - scores['test_f1'].mean()
     if gap > 0.05:
         print(f"Overfitting CV gap : {gap:.4f}")
@@ -217,6 +230,13 @@ def cross_val_report(name, model, X, y, random_state=42):
         "cv_test_f1_mean": float(scores['test_f1'].mean()),
         "cv_test_f1_std": float(scores['test_f1'].std()),
         "cv_test_acc_mean": float(scores['test_accuracy'].mean()),
+        "cv_auc_mean": float(scores['test_roc_auc'].mean()),
+        "cv_auc_std": float(scores['test_roc_auc'].std()),
+        "cv_balacc_mean": float(scores['test_balanced_accuracy'].mean()),
+        "cv_mcc_mean": float(scores['test_matthews_corrcoef'].mean()),
+        # AUC cross-validée exposée comme métrique principale : stable, contrairement
+        # à l'AUC d'un unique holdout de quelques fichiers.
+        "auc": float(scores['test_roc_auc'].mean()),
     }
 
 
@@ -240,9 +260,10 @@ def main():
     ap.add_argument("--include-total-commits", action="store_true",
                     help="Inclure git_total_commits dans les features "
                          "(leakage partiel, pour comparaison)")
-    ap.add_argument("--feature-set", choices=["v1", "v2"], default="v2",
+    ap.add_argument("--feature-set", choices=["v1", "v2", "v3"], default="v3",
                     help="v1 = toutes les features safe, "
-                         "v2 = nettoyées post-EDA (défaut)")
+                         "v2 = nettoyées post-EDA, "
+                         "v3 = structure pure sans features git de fenêtre (défaut, leak-free)")
     ap.add_argument("--compare", action="store_true",
                     help="Entraîne avec v1 ET v2 et compare les résultats")
     args = ap.parse_args()
@@ -250,9 +271,9 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     df = load_dataset(args.dataset)
 
-    # ── Choix du jeu de features ────────────────────────────────────────────
+    # Choix du jeu de features
     if args.compare:
-        # Mode comparaison : entraîne avec les deux sets et affiche les deltas
+        # Mode comparaison entraîne avec les deux sets et affiche les deltas
         print("\n" + "=" * 60)
         print("MODE COMPARAISON v1 vs v2")
         print("=" * 60)
@@ -260,8 +281,12 @@ def main():
         return
 
     if args.include_total_commits:
-        feature_list = FEATURES_WITH_COMMITS_V2 if args.feature_set == "v2" else FEATURES_WITH_COMMITS
-        print(f"\n⚠ Mode avec git_total_commits (leakage partiel, feature-set={args.feature_set})")
+        feature_list = FEATURES_WITH_COMMITS_V2 if args.feature_set in ("v2", "v3") else FEATURES_WITH_COMMITS
+        print(f"\nMode avec git_total_commits (leakage partiel, feature-set={args.feature_set})")
+    elif args.feature_set == "v3":
+        feature_list = SAFE_FEATURES_V3
+        print(f"\nMode structure-seule v3 : features git de fenêtre retirées")
+        print(f"   Retirées en plus de v2 : {GIT_WINDOW_FEATURES}")
     elif args.feature_set == "v2":
         feature_list = SAFE_FEATURES_V2
         print(f"\nMode safe v2 (post-EDA) : {len(EDA_DROP)} features retirées")
@@ -279,19 +304,25 @@ def main():
 
     X = df[feats].fillna(-1.0).values
     y = df[LABEL_COL].astype(int).values
+    groups = df["file"].values  # 1 groupe = 1 fichier (et toutes ses méthodes)
 
     if y.sum() == 0 or y.sum() == len(y):
         raise SystemExit("Le label est constant (que des 0 ou que des 1). "
                          "Ajuste --bugfix-threshold ou la fenêtre temporelle.")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, stratify=y, random_state=args.random_state,
-    )
-    print(f"\nTrain : {len(X_train)} | Test : {len(X_test)}")
+    # Split groupé : aucun fichier à cheval sur train et test (anti-fuite de groupe)
+    gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size,
+                            random_state=args.random_state)
+    train_idx, test_idx = next(gss.split(X, y, groups))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    print(f"\nTrain : {len(X_train)} | Test : {len(X_test)} "
+          f"| Fichiers : {len(set(groups))} "
+          f"(train {len(set(groups[train_idx]))} / test {len(set(groups[test_idx]))})")
 
     all_metrics = []
 
-    # ── 1. Logistic Regression ──────────────────────────────────────────────
+    # Logistic Regression
     print("\n" + "=" * 60)
     print("1. Logistic Regression (baseline)")
     print("=" * 60)
@@ -314,12 +345,12 @@ def main():
         print(f"   Best params : {lr_grid.best_params_}")
 
     m = evaluate("LogisticRegression", best_lr, X_train, y_train, X_test, y_test)
-    m.update(cross_val_report("LogisticRegression", lr_pipe, X, y, args.random_state))
+    m.update(cross_val_report("LogisticRegression", lr_pipe, X, y, groups, args.random_state))
     all_metrics.append(m)
     confusion_plot("LogReg", best_lr, X_test, y_test,
                    os.path.join(args.output_dir, "confusion_logreg.png"))
 
-    # ── 2. Random Forest (contraint) ────────────────────────────────────────
+    # Random Forest (contraint)
     print("\n" + "=" * 60)
     print("2. Random Forest")
     print("=" * 60)
@@ -343,7 +374,7 @@ def main():
         print(f"   Best params : {rf_grid.best_params_}")
 
     m = evaluate("RandomForest", best_rf, X_train, y_train, X_test, y_test)
-    m.update(cross_val_report("RandomForest", best_rf, X, y, args.random_state))
+    m.update(cross_val_report("RandomForest", best_rf, X, y, groups, args.random_state))
     all_metrics.append(m)
     confusion_plot("RandomForest", best_rf, X_test, y_test,
                    os.path.join(args.output_dir, "confusion_rf.png"))
@@ -358,7 +389,7 @@ def main():
     print("\n Top 10 features (RandomForest) :")
     print(importances.head(10).to_string(index=False))
 
-    # ── 3. XGBoost ──────────────────────────────────────────────────────────
+    # XGBoost
     xgb = None
     if HAS_XGB:
         print("\n" + "=" * 60)
@@ -369,18 +400,18 @@ def main():
             n_estimators=200, max_depth=4, learning_rate=0.1,
             min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
             scale_pos_weight=spw, eval_metric="logloss",
-            use_label_encoder=False, random_state=args.random_state,
+            random_state=args.random_state,
         )
         xgb.fit(X_train, y_train)
         m = evaluate("XGBoost", xgb, X_train, y_train, X_test, y_test)
-        m.update(cross_val_report("XGBoost", xgb, X, y, args.random_state))
+        m.update(cross_val_report("XGBoost", xgb, X, y, groups, args.random_state))
         all_metrics.append(m)
         confusion_plot("XGBoost", xgb, X_test, y_test,
                        os.path.join(args.output_dir, "confusion_xgb.png"))
     else:
         print("\n XGBoost non installe — pip install xgboost pour l'activer")
 
-    # ── Résumé comparatif ───────────────────────────────────────────────────
+    # Résumé comparatif
     print("\n" + "=" * 60)
     print("RESUME COMPARATIF")
     print("=" * 60)
@@ -394,16 +425,22 @@ def main():
         print(f"{m['model']:<25} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f} "
               f"{cv_f1:>14} {gap_str:>8}{flag} {auc:>8}")
 
-    # ── Sélection du meilleur (sur CV F1, pas test F1 seul) ────────────────
-    best = max(all_metrics, key=lambda m: m.get("cv_test_f1_mean", m["f1"]))
+    # Sélection du meilleur sur le MCC cross-validé : métrique robuste au
+    # déséquilibre (le F1 favorise artificiellement le modèle qui colle à la
+    # classe majoritaire). Fallback sur CV F1 si le MCC n'est pas disponible.
+    best = max(all_metrics, key=lambda m: m.get("cv_mcc_mean",
+                                                m.get("cv_test_f1_mean", m["f1"])))
     print(f"\nMeilleur modele : {best['model']}  "
-          f"(CV F1={best.get('cv_test_f1_mean', best['f1']):.4f})")
+          f"(MCC CV={best.get('cv_mcc_mean', 0):.4f} | "
+          f"AUC CV={best.get('cv_auc_mean', 0):.4f} | "
+          f"bal-acc={best.get('cv_balacc_mean', 0):.4f})")
 
-    if best["overfit_gap"] > 0.1:
-        print(f"Attention : gap train/test = {best['overfit_gap']:.4f}, "
-              "le modele pourrait ne pas generaliser.")
+    if best.get("overfit_gap", 0) > 0.1:
+        print(f"Note : gap train/test (holdout) = {best['overfit_gap']:.4f} "
+              "— à relativiser, le holdout ne fait que quelques fichiers ; "
+              "le gap CV est la référence.")
 
-    # ── Sauvegarde ──────────────────────────────────────────────────────────
+    # Sauvegarde
     name_to_model = {
         "LogisticRegression": best_lr,
         "RandomForest": best_rf,
@@ -425,7 +462,7 @@ def main():
     print("   - feature_importance.csv")
     print("   - confusion_*.png")
 
-    # ── Conseil ─────────────────────────────────────────────────────────────
+    # Conseil
     if not args.include_total_commits:
         print("\n Pour comparer avec git_total_commits, relance avec :")
         print(f"   python {__file__} {args.dataset} --include-total-commits")
@@ -442,10 +479,12 @@ def _quick_train(df, feature_list, test_size, random_state):
     feats = [c for c in feature_list if c in df.columns]
     X = df[feats].fillna(-1.0).values
     y = df[LABEL_COL].astype(int).values
+    groups = df["file"].values
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=random_state,
-    )
+    gss = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+    train_idx, test_idx = next(gss.split(X, y, groups))
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
 
     results = {}
     # XGBoost
@@ -455,7 +494,7 @@ def _quick_train(df, feature_list, test_size, random_state):
             n_estimators=200, max_depth=4, learning_rate=0.1,
             min_child_weight=5, subsample=0.8, colsample_bytree=0.8,
             scale_pos_weight=spw, eval_metric="logloss",
-            use_label_encoder=False, random_state=random_state,
+            random_state=random_state,
         )
         model.fit(X_train, y_train)
 
@@ -463,8 +502,8 @@ def _quick_train(df, feature_list, test_size, random_state):
         train_f1 = f1_score(y_train, model.predict(X_train), zero_division=0)
         test_f1 = f1_score(y_test, y_pred, zero_division=0)
 
-        cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=random_state)
-        scores = cross_validate(model, X, y, cv=cv, scoring=["f1"], n_jobs=-1)
+        cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+        scores = cross_validate(model, X, y, groups=groups, cv=cv, scoring=["f1"], n_jobs=-1)
         cv_f1 = scores["test_f1"].mean()
         cv_std = scores["test_f1"].std()
 
@@ -489,8 +528,8 @@ def _quick_train(df, feature_list, test_size, random_state):
     train_f1 = f1_score(y_train, rf.predict(X_train), zero_division=0)
     test_f1 = f1_score(y_test, y_pred, zero_division=0)
 
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=random_state)
-    scores = cross_validate(rf, X, y, cv=cv, scoring=["f1"], n_jobs=-1)
+    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+    scores = cross_validate(rf, X, y, groups=groups, cv=cv, scoring=["f1"], n_jobs=-1)
     cv_f1 = scores["test_f1"].mean()
     cv_std = scores["test_f1"].std()
 
@@ -533,7 +572,7 @@ def _run_comparison(df, args):
         for ver, res in [("v1", r1[model_name]), ("v2", r2[model_name])]:
             cv_str = f"{res['cv_f1']:.4f}+/-{res['cv_std']:.3f}"
             auc_str = f"{res['auc']:.4f}" if res['auc'] is not None else "  N/A"
-            gap_flag = " ⚠" if res['gap'] > 0.05 else ""
+            gap_flag = " " if res['gap'] > 0.05 else ""
             print(f"{model_name:<18} {ver:<5} {res['train_f1']:>10.4f} {res['test_f1']:>10.4f} "
                   f"{cv_str:>14} {res['gap']:>8.4f}{gap_flag} {auc_str:>8}")
 
