@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pathlib import Path
@@ -8,7 +8,9 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import os
 import subprocess
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import logging
@@ -150,6 +152,7 @@ class GenerateTestRequest(BaseModel):
     class_name: Optional[str] = Field(default=None, max_length=255)
     model_name: Optional[str] = Field(default=None, max_length=200)
     deterministic: bool = False  # True = bypass LLM, génération depuis les chunks
+    async_mode: bool = False    # True = retourne job_id immédiatement, poll /job/{id}/status
     model_config = {"protected_namespaces": ()}
 
     def model_post_init(self, __ctx) -> None:
@@ -165,6 +168,7 @@ class GenerateUnitTestRequest(BaseModel):
     description: str = Field(..., min_length=1, max_length=4000)
     test_name: Optional[str] = Field(default=None, max_length=200)
     model_name: Optional[str] = Field(default=None, max_length=200)
+    async_mode: bool = False
     model_config = {"protected_namespaces": ()}
 
     def model_post_init(self, __ctx) -> None:
@@ -1209,6 +1213,37 @@ SCENARIO_BUILDERS = [
 ]
 
 
+# JOB STORE — suivi des tâches asynchrones (en mémoire, TTL 2h)
+# Pour un usage multi-worker, remplacer par Redis ou une DB.
+
+_jobs: Dict[str, Dict] = {}
+_jobs_lock = threading.Lock()
+_JOB_TTL_SEC = 7200  # 2 heures
+
+
+def _new_job(**meta) -> str:
+    """Crée un job, retourne son ID (12 hex chars). Purge les jobs expirés."""
+    job_id = uuid.uuid4().hex[:12]
+    now = time.time()
+    with _jobs_lock:
+        stale = [k for k, v in _jobs.items() if now - v.get("ts", 0) > _JOB_TTL_SEC]
+        for k in stale:
+            del _jobs[k]
+        _jobs[job_id] = {"status": "pending", "ts": now, "result": None, "error": None, **meta}
+    return job_id
+
+
+def _update_job(job_id: str, **kwargs) -> None:
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id].update(kwargs)
+
+
+def _get_job(job_id: str) -> Dict:
+    with _jobs_lock:
+        return dict(_jobs.get(job_id, {}))
+
+
 # ENDPOINTS — SANTÉ ET ADMINISTRATION
 
 @app.get("/health", summary="Vérification de santé", tags=["santé"])
@@ -1558,12 +1593,27 @@ def learn_from_code(
 )
 def generate_test(
     data: GenerateTestRequest,
+    background_tasks: BackgroundTasks,
     db: KnowledgeDB = Depends(get_db),
 ):
     """
     Génère un WebTestCase PHP à partir d'une description en langage naturel,
     en utilisant le contexte RAG (routes, templates, formulaires) du projet.
+    Avec async_mode=true : retourne un job_id immédiatement, poll GET /job/{id}/status.
     """
+    if data.async_mode:
+        job_id = _new_job(
+            type="functional",
+            project_id=data.project_id,
+            class_name=data.class_name or "?",
+        )
+        background_tasks.add_task(_bg_generate_test, job_id, data, db)
+        return {
+            "status":   "accepted",
+            "job_id":   job_id,
+            "poll_url": f"/job/{job_id}/status",
+        }
+
     start_time = time.time()
     _check_model_allowed(data.model_name)
     brain = get_brain(model_name=data.model_name)
@@ -1828,12 +1878,27 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
 )
 def generate_unit_test(
     data: GenerateUnitTestRequest,
+    background_tasks: BackgroundTasks,
     db: KnowledgeDB = Depends(get_db),
 ):
     """
     Génère un test unitaire PHPUnit pour une classe ou méthode donnée,
     en injectant son code source + le contexte des classes dépendantes (RAG).
+    Avec async_mode=true : retourne un job_id immédiatement, poll GET /job/{id}/status.
     """
+    if data.async_mode:
+        job_id = _new_job(
+            type="unit",
+            project_id=data.project_id,
+            class_name=data.class_name,
+        )
+        background_tasks.add_task(_bg_generate_unit_test, job_id, data, db)
+        return {
+            "status":   "accepted",
+            "job_id":   job_id,
+            "poll_url": f"/job/{job_id}/status",
+        }
+
     start_time = time.time()
 
     # Extraction du code source à tester (path traversal protégé via _safe_join)
@@ -1924,3 +1989,111 @@ DIRECTIVES :
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# WRAPPERS ASYNCHRONES
+# Appelés par BackgroundTasks — exécutés APRÈS l'envoi de la réponse HTTP.
+# Toutes les exceptions sont capturées et stockées dans le job store.
+
+def _bg_generate_test(job_id: str, data: GenerateTestRequest, db: KnowledgeDB) -> None:
+    """Lance generate_test en arrière-plan et met à jour le job store."""
+    try:
+        _update_job(job_id, status="running")
+        # Appel synchrone avec async_mode=False pour éviter la récursion
+        sync_data = data.model_copy(update={"async_mode": False})
+        # On simule l'appel direct à la logique métier via BackgroundTasks
+        from fastapi import BackgroundTasks as _BT
+        dummy_bt = _BT()
+        result = generate_test(sync_data, dummy_bt, db)
+        _update_job(job_id, status="done", result=result)
+    except Exception as e:
+        logging.error(f"[job:{job_id}] Erreur generate_test : {e}", exc_info=True)
+        _update_job(job_id, status="error", error=str(e))
+
+
+def _bg_generate_unit_test(job_id: str, data: GenerateUnitTestRequest, db: KnowledgeDB) -> None:
+    """Lance generate_unit_test en arrière-plan et met à jour le job store."""
+    try:
+        _update_job(job_id, status="running")
+        sync_data = data.model_copy(update={"async_mode": False})
+        from fastapi import BackgroundTasks as _BT
+        dummy_bt = _BT()
+        result = generate_unit_test(sync_data, dummy_bt, db)
+        _update_job(job_id, status="done", result=result)
+    except Exception as e:
+        logging.error(f"[job:{job_id}] Erreur generate_unit_test : {e}", exc_info=True)
+        _update_job(job_id, status="error", error=str(e))
+
+
+# ENDPOINT — STATUT D'UN JOB ASYNCHRONE
+
+@app.get(
+    "/job/{job_id}/status",
+    summary="Statut d'une génération asynchrone",
+    tags=["génération"],
+    dependencies=[Depends(require_api_key)],
+)
+def job_status(job_id: str):
+    """
+    Retourne l'état d'une tâche lancée avec async_mode=true.
+    Statuts : pending → running → done | error.
+    Quand status=done, le champ `result` contient la réponse complète.
+    """
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' introuvable ou expiré (TTL 2h).")
+    # On n'expose pas le timestamp interne
+    job.pop("ts", None)
+    return job
+
+
+# ENDPOINT — GÉNÉRATION EN LOT (éclatement par classe)
+
+class GenerateTestsBatchRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
+    class_names: List[str] = Field(..., min_items=1, max_items=50)
+    deterministic: bool = True   # Défaut déterministe pour le lot (plus rapide, zéro hallucination)
+    description_prefix: str = Field(
+        default="Tests fonctionnels pour",
+        max_length=200,
+    )
+
+
+@app.post(
+    "/generate-tests-batch",
+    summary="Génère des tests pour plusieurs classes en parallèle (async)",
+    tags=["génération"],
+    dependencies=[Depends(require_api_key)],
+)
+def generate_tests_batch(
+    data: GenerateTestsBatchRequest,
+    background_tasks: BackgroundTasks,
+    db: KnowledgeDB = Depends(get_db),
+):
+    """
+    Lance la génération de tests pour chaque classe listée en arrière-plan.
+    Retourne un batch_id et un job_id par classe.
+    Poll GET /job/{job_id}/status pour suivre chaque classe individuellement.
+    """
+    batch_id = uuid.uuid4().hex[:8]
+    jobs = []
+
+    for class_name in data.class_names:
+        safe = re.sub(r"[^a-zA-Z0-9]", "", class_name)
+        req = GenerateTestRequest(
+            project_id=data.project_id,
+            description=f"{data.description_prefix} {class_name}",
+            class_name=class_name,
+            test_name=f"{safe}Test",
+            deterministic=data.deterministic,
+            async_mode=False,  # exécuté directement dans le thread du lot
+        )
+        job_id = _new_job(type="functional", project_id=data.project_id, class_name=class_name)
+        background_tasks.add_task(_bg_generate_test, job_id, req, db)
+        jobs.append({"class_name": class_name, "job_id": job_id, "poll_url": f"/job/{job_id}/status"})
+
+    logging.info(f"[batch:{batch_id}] {len(jobs)} jobs lancés pour project_id={data.project_id}")
+    return {
+        "status":   "accepted",
+        "batch_id": batch_id,
+        "jobs":     jobs,
+        "note":     f"{len(jobs)} générations lancées en arrière-plan — poll chaque poll_url pour le résultat.",
+    }
