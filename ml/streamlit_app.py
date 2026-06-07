@@ -543,38 +543,81 @@ elif page == "Génération de tests":
                                   height=80)
             f_test_name = st.text_input("Nom du test (optionnel)",
                                         placeholder="ProductControllerTest")
-            f_det = st.checkbox("Mode déterministe (sans LLM)", value=False)
+            f_det   = st.checkbox("Mode déterministe (sans LLM)", value=True)
+            f_async = st.checkbox("Mode asynchrone (non-bloquant)", value=True,
+                                  help="Retourne un job_id immédiatement et poll le résultat.")
             if st.form_submit_button("Générer le test fonctionnel"):
                 if not f_project or not f_desc:
                     st.error("project_id et description sont obligatoires.")
                 elif not api_ok:
                     st.error("API hors ligne.")
                 else:
-                    with st.spinner("Génération en cours…"):
+                    payload = {"project_id": f_project, "description": f_desc,
+                               "deterministic": f_det, "async_mode": f_async}
+                    if f_class:
+                        payload["class_name"] = f_class
+                    if f_test_name:
+                        payload["test_name"] = f_test_name
+
+                    if f_async:
+                        # Mode async : on lance et on stocke le job_id en session
                         try:
-                            payload = {"project_id": f_project, "description": f_desc,
-                                       "deterministic": f_det}
-                            if f_class:
-                                payload["class_name"] = f_class
-                            if f_test_name:
-                                payload["test_name"] = f_test_name
                             r = requests.post(f"{TEST_ENGINE_URL}/generate-test",
-                                              json=payload, headers=api_headers(), timeout=900)
+                                              json=payload, headers=api_headers(), timeout=30)
                             if r.status_code == 200:
                                 body = r.json()
-                                st.success(f"Test généré : `{body.get('file','')}`")
-                                code = body.get("code") or body.get("content", "")
-                                if code:
-                                    st.code(code, language="php")
-                                    st.download_button("Télécharger", code.encode("utf-8"),
-                                                       file_name=body.get("file", "test.php"))
-                                with st.expander("Réponse complète"):
-                                    st.json(body)
+                                st.session_state["pending_job"] = body.get("job_id")
+                                st.info(f"Job lancé : `{body.get('job_id')}` — résultat dans quelques instants…")
                             else:
-                                st.error(f"HTTP {r.status_code}")
-                                st.code(r.text)
+                                st.error(f"HTTP {r.status_code} — {r.text[:200]}")
                         except Exception as e:
                             st.error(f"Erreur : {e}")
+                    else:
+                        with st.spinner("Génération en cours (mode sync)…"):
+                            try:
+                                r = requests.post(f"{TEST_ENGINE_URL}/generate-test",
+                                                  json=payload, headers=api_headers(), timeout=900)
+                                if r.status_code == 200:
+                                    body = r.json()
+                                    st.success(f"Test généré : `{body.get('file', '')}`")
+                                    st.info(body.get("note", ""))
+                                    with st.expander("Réponse complète"):
+                                        st.json(body)
+                                else:
+                                    st.error(f"HTTP {r.status_code}")
+                                    st.code(r.text)
+                            except Exception as e:
+                                st.error(f"Erreur : {e}")
+
+        # ── Polling du job en cours ────────────────────────────────────────────
+        if st.session_state.get("pending_job"):
+            job_id = st.session_state["pending_job"]
+            st.markdown(f"**Job en cours : `{job_id}`**")
+            col_poll, col_cancel = st.columns([1, 1])
+            if col_poll.button("Actualiser le statut", key="btn_poll"):
+                try:
+                    r = requests.get(f"{TEST_ENGINE_URL}/job/{job_id}/status",
+                                     headers=api_headers(), timeout=10)
+                    if r.status_code == 200:
+                        job = r.json()
+                        status = job.get("status", "?")
+                        if status == "done":
+                            st.success("Terminé !")
+                            st.info(job.get("result", {}).get("note", ""))
+                            st.json(job.get("result", {}))
+                            st.session_state.pop("pending_job", None)
+                        elif status == "error":
+                            st.error(f"Erreur : {job.get('error', '?')}")
+                            st.session_state.pop("pending_job", None)
+                        else:
+                            st.info(f"Statut : **{status}** — réactualise dans quelques secondes.")
+                    else:
+                        st.warning(f"HTTP {r.status_code}")
+                except Exception as e:
+                    st.error(f"Erreur polling : {e}")
+            if col_cancel.button("Annuler le suivi", key="btn_cancel"):
+                st.session_state.pop("pending_job", None)
+                st.rerun()
 
     with tab_unit:
         st.markdown('<div class="section-header">Générer un test unitaire PHPUnit</div>',
@@ -587,36 +630,78 @@ elif page == "Génération de tests":
             u_desc = st.text_area("Description du comportement à tester",
                                   placeholder="calculateTotal retourne 0 pour un panier vide",
                                   height=80)
-            u_det = st.checkbox("Mode déterministe (sans LLM)", value=False, key="u_det")
+            u_det   = st.checkbox("Mode déterministe (sans LLM)", value=False, key="u_det")
+            u_async = st.checkbox("Mode asynchrone (non-bloquant)", value=True, key="u_async",
+                                  help="Retourne un job_id immédiatement et poll le résultat.")
             if st.form_submit_button("Générer le test unitaire"):
                 if not u_project or not u_desc:
                     st.error("project_id et description sont obligatoires.")
                 elif not api_ok:
                     st.error("API hors ligne.")
                 else:
-                    with st.spinner("Génération en cours…"):
+                    payload = {"project_id": u_project, "description": u_desc,
+                               "deterministic": u_det, "async_mode": u_async}
+                    if u_class:
+                        payload["class_name"] = u_class
+
+                    if u_async:
                         try:
-                            payload = {"project_id": u_project, "description": u_desc,
-                                       "deterministic": u_det}
-                            if u_class:
-                                payload["class_name"] = u_class
                             r = requests.post(f"{TEST_ENGINE_URL}/generate-unit-test",
-                                              json=payload, headers=api_headers(), timeout=900)
+                                              json=payload, headers=api_headers(), timeout=30)
                             if r.status_code == 200:
                                 body = r.json()
-                                st.success(f"Test généré : `{body.get('file','')}`")
-                                code = body.get("code") or body.get("content", "")
-                                if code:
-                                    st.code(code, language="php")
-                                    st.download_button("Télécharger", code.encode("utf-8"),
-                                                       file_name=body.get("file", "unit_test.php"))
-                                with st.expander("Réponse complète"):
-                                    st.json(body)
+                                st.session_state["pending_unit_job"] = body.get("job_id")
+                                st.info(f"Job lancé : `{body.get('job_id')}` — résultat dans quelques instants…")
                             else:
-                                st.error(f"HTTP {r.status_code}")
-                                st.code(r.text)
+                                st.error(f"HTTP {r.status_code} — {r.text[:200]}")
                         except Exception as e:
                             st.error(f"Erreur : {e}")
+                    else:
+                        with st.spinner("Génération en cours (mode sync)…"):
+                            try:
+                                r = requests.post(f"{TEST_ENGINE_URL}/generate-unit-test",
+                                                  json=payload, headers=api_headers(), timeout=900)
+                                if r.status_code == 200:
+                                    body = r.json()
+                                    st.success(f"Test généré : `{body.get('file', '')}`")
+                                    st.info(body.get("note", ""))
+                                    with st.expander("Réponse complète"):
+                                        st.json(body)
+                                else:
+                                    st.error(f"HTTP {r.status_code}")
+                                    st.code(r.text)
+                            except Exception as e:
+                                st.error(f"Erreur : {e}")
+
+        # ── Polling du job unitaire en cours ──────────────────────────────────
+        if st.session_state.get("pending_unit_job"):
+            unit_job_id = st.session_state["pending_unit_job"]
+            st.markdown(f"**Job en cours : `{unit_job_id}`**")
+            col_upoll, col_ucancel = st.columns([1, 1])
+            if col_upoll.button("Actualiser le statut", key="btn_upoll"):
+                try:
+                    r = requests.get(f"{TEST_ENGINE_URL}/job/{unit_job_id}/status",
+                                     headers=api_headers(), timeout=10)
+                    if r.status_code == 200:
+                        job = r.json()
+                        status = job.get("status", "?")
+                        if status == "done":
+                            st.success("Terminé !")
+                            st.info(job.get("result", {}).get("note", ""))
+                            st.json(job.get("result", {}))
+                            st.session_state.pop("pending_unit_job", None)
+                        elif status == "error":
+                            st.error(f"Erreur : {job.get('error', '?')}")
+                            st.session_state.pop("pending_unit_job", None)
+                        else:
+                            st.info(f"Statut : **{status}** — réactualise dans quelques secondes.")
+                    else:
+                        st.warning(f"HTTP {r.status_code}")
+                except Exception as e:
+                    st.error(f"Erreur polling : {e}")
+            if col_ucancel.button("Annuler le suivi", key="btn_ucancel"):
+                st.session_state.pop("pending_unit_job", None)
+                st.rerun()
 
 
 # PAGE : PERFORMANCE
