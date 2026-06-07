@@ -1664,6 +1664,7 @@ def generate_test(
             "entities_detected":  entity_types,
             "context_used":       _build_context_str(context_chunks),
             "time_sec":           round(time.time() - start_time, 2),
+            "note":               "Brouillon généré automatiquement — à relire et adapter avant exécution (fixtures, valeurs de test, cas limites).",
         }
 
     context_str = _build_context_str(context_chunks)
@@ -1803,11 +1804,13 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
 
         return {
             "status":             "success",
+            "mode":               "llm",
             "controller_profile": controller_profile,
             "file":               filename,
             "path":               rel_path,
             "context_used":       context_str,
             "time_sec":           round(gen_time, 2),
+            "note":               "Brouillon généré automatiquement — à relire et adapter avant exécution (fixtures, valeurs de test, cas limites).",
         }
 
     except Exception as e:
@@ -1913,6 +1916,7 @@ DIRECTIVES :
             "file":     f"{class_short}Test.php",
             "path":     rel_path,
             "time_sec": round(gen_time, 2),
+            "note":     "Brouillon généré automatiquement — à relire et adapter avant exécution (mocks, cas limites, assertions métier).",
         }
 
     except Exception as e:
