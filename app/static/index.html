@@ -543,14 +543,27 @@
       <small>Génère plusieurs tests fonctionnels en parallèle en mode asynchrone.</small>
     </h2>
     <div style="background:rgba(79,70,229,.1);border:1px solid rgba(79,70,229,.4);border-radius:var(--radius);padding:14px 16px;margin-bottom:20px;font-size:.875rem;">
-      Chaque ligne = un test. Format JSON d'une liste de <code>GenerateTestRequest</code>. Les jobs sont lancés en arrière-plan ; récupérez les job_ids et sondez <code>/job/{id}/status</code>.
+      Un job asynchrone par classe. Récupérez les <code>job_id</code> et sondez <code>/job/{id}/status</code>.
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>project_id <span>*</span></label>
+        <input type="text" id="batch-pid" placeholder="sucre" value="sucre"/>
+      </div>
+      <div class="form-group">
+        <label>Préfixe description</label>
+        <input type="text" id="batch-prefix" value="Tests fonctionnels pour"/>
+      </div>
     </div>
     <div class="form-group">
-      <label>Requêtes (JSON array) <span>*</span></label>
-      <textarea id="batch-body" style="min-height:180px;font-family:monospace;font-size:.82rem;">[
-  {"project_id": "sucre", "description": "Tester GET /products", "class_name": "ProductController"},
-  {"project_id": "sucre", "description": "Tester POST /orders", "class_name": "OrderController"}
-]</textarea>
+      <label>Noms de classes <span>*</span> <span style="font-weight:400;color:var(--muted)">(une par ligne)</span></label>
+      <textarea id="batch-classes" style="min-height:120px;font-family:monospace;font-size:.85rem;" placeholder="ProductController&#10;OrderController&#10;UserController"></textarea>
+    </div>
+    <div class="form-group">
+      <label class="checkbox-row">
+        <input type="checkbox" id="batch-det" checked/>
+        Mode déterministe (recommandé pour le batch — rapide, sans LLM)
+      </label>
     </div>
     <button class="btn btn-primary" onclick="runBatch()">Lancer le batch</button>
     <div id="res-batch"></div>
@@ -876,13 +889,17 @@
   // ── Batch ─────────────────────────────────────────────────────────────────
   async function runBatch() {
     const btn = event.target;
-    let requests;
-    try { requests = JSON.parse(document.getElementById('batch-body').value); }
-    catch(e) { return toast('JSON invalide : ' + e.message, false); }
-    if (!Array.isArray(requests) || requests.length === 0) return toast('Liste vide', false);
+    const pid    = document.getElementById('batch-pid').value.trim();
+    const prefix = document.getElementById('batch-prefix').value.trim();
+    const det    = document.getElementById('batch-det').checked;
+    const raw    = document.getElementById('batch-classes').value;
+    const names  = raw.split('\n').map(s => s.trim()).filter(Boolean);
+    if (!pid)             return toast('project_id requis', false);
+    if (names.length === 0) return toast('Au moins une classe requise', false);
     setLoading(btn, true);
+    const body = { project_id: pid, class_names: names, description_prefix: prefix, deterministic: det };
     try {
-      const { status, data } = await apiFetch('POST', '/generate-tests-batch', { requests });
+      const { status, data } = await apiFetch('POST', '/generate-tests-batch', body);
       renderResponse('res-batch', status, data);
       toast(status === 200 ? `${data.jobs?.length ?? 0} jobs lancés` : `Erreur ${status}`, status === 200);
     } catch(e) { renderResponse('res-batch', 0, { error: e.message }); }
