@@ -49,6 +49,18 @@ services:
       OLLAMA_URL:               http://host.docker.internal:11434/api/generate
       DEFAULT_EMBEDDING_MODEL:  paraphrase-multilingual-MiniLM-L12-v2
       DEFAULT_LLM_MODEL:        qwen2.5-coder:3b
+      # --- Réglages d'inférence LLM (modifiables sans rebuild) ---
+      # num_ctx  : taille de la fenêtre de contexte (tokens). 8192 = safe sur 8 Go RAM.
+      # num_predict : tokens max en sortie. ~2,5 tok/s sur CPU → 1500 ≈ 10 min/appel.
+      # keep_alive  : durée en RAM après un appel ("-1" = jamais décharger).
+      # coverage_retry_max : nb de routes manquantes au-delà duquel on ne relance pas.
+      LLM_NUM_CTX:              8192
+      LLM_NUM_PREDICT:          1500
+      LLM_KEEP_ALIVE:           30m
+      LLM_COVERAGE_RETRY_MAX:   6
+      # --- Auth / sécurité (à définir en prod) ---
+      # API_KEY:                changeme          # header X-API-Key requis si défini
+      # CORS_ORIGINS:           http://localhost  # origines autorisées, CSV
       # CONTAINER_PROJECT_ROOT est /workspace par defaut (voir config.py)
       # Surcharger ici seulement si le projet n'est pas le dossier parent direct :
       # CONTAINER_PROJECT_ROOT: /workspace/mon-sous-dossier

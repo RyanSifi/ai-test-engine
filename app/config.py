@@ -2,6 +2,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 class Settings(BaseSettings):
+    # Source de vérité unique selon le contexte :
+    #   - Docker  → variables du bloc `environment:` dans docker-compose.yml
+    #   - Local   → fichier .env à la racine du projet (dev uniquement, non versionné)
+    # Les variables d'environnement process ont TOUJOURS priorité sur le fichier .env.
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 
     database_url: str
