@@ -590,3 +590,108 @@ class Foo extends Bar
         assert "private int $x"      in block
         assert "public function bar" in block
         assert block.count("{") == block.count("}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints asynchrones — job store, batch
+# ---------------------------------------------------------------------------
+
+class TestAsyncEndpoints:
+    """Teste async_mode, /job/{id}/status et /generate-tests-batch."""
+
+    def test_generate_test_async_returns_job_id(self, client_with_mocks):
+        """async_mode=True → réponse immédiate avec status=accepted et job_id."""
+        client, mock_db, _ = client_with_mocks
+        mock_db.find_closest_code_context.return_value = [CHUNK_CLASS, CHUNK_METHOD_RENDER]
+
+        with patch("main._write_php_file"), \
+             patch("main._load_golden_dataset", return_value=[]):
+            r = client.post("/generate-test", json={
+                "project_id":  "proj_test",
+                "description": "Tester la page liste en async",
+                "async_mode":  True,
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"]   == "accepted"
+        assert "job_id"         in body
+        assert "poll_url"       in body
+        assert body["poll_url"] == f"/job/{body['job_id']}/status"
+
+    def test_generate_unit_test_async_returns_job_id(self, client_with_mocks):
+        """async_mode=True sur generate-unit-test → job_id immédiat."""
+        client, _, _ = client_with_mocks
+
+        with patch("main.extract_code_for_symbol", return_value=["class FooService {}"]):
+            r = client.post("/generate-unit-test", json={
+                "project_id":  "proj_test",
+                "file_path":   "src/Service/FooService.php",
+                "class_name":  "FooService",
+                "description": "test async unit",
+                "async_mode":  True,
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "accepted"
+        assert "job_id"       in body
+
+    def test_job_status_unknown_returns_404(self, client_with_mocks):
+        """Un job_id inexistant retourne 404."""
+        client, _, _ = client_with_mocks
+        r = client.get("/job/doesnotexist000/status")
+        assert r.status_code == 404
+
+    def test_job_status_known_job_is_reachable(self, client_with_mocks):
+        """Un job créé via async_mode est immédiatement pollable."""
+        client, mock_db, _ = client_with_mocks
+        mock_db.find_closest_code_context.return_value = [CHUNK_CLASS, CHUNK_METHOD_RENDER]
+
+        with patch("main._write_php_file"), \
+             patch("main._load_golden_dataset", return_value=[]):
+            r = client.post("/generate-test", json={
+                "project_id":  "proj_test",
+                "description": "async poll test",
+                "async_mode":  True,
+            })
+
+        job_id = r.json().get("job_id")
+        assert job_id, "job_id manquant dans la réponse"
+
+        r2 = client.get(f"/job/{job_id}/status")
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["job_id"] == job_id
+        assert body2["status"] in ("pending", "running", "done", "error")
+
+    def test_batch_launches_jobs(self, client_with_mocks):
+        """Le batch crée un job par classe et retourne leur poll_url."""
+        client, mock_db, _ = client_with_mocks
+        mock_db.find_closest_code_context.return_value = [CHUNK_CLASS, CHUNK_METHOD_RENDER]
+
+        with patch("main._write_php_file"), \
+             patch("main._load_golden_dataset", return_value=[]):
+            r = client.post("/generate-tests-batch", json={
+                "project_id":    "proj_test",
+                "class_names":   ["FooController", "BarController"],
+                "deterministic": True,
+            })
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "accepted"
+        assert len(body["jobs"]) == 2
+        for job in body["jobs"]:
+            assert "job_id"   in job
+            assert "poll_url" in job
+
+    def test_batch_empty_class_names_returns_422(self, client_with_mocks):
+        """Un batch sans classe retourne une erreur de validation (422)."""
+        client, _, _ = client_with_mocks
+        r = client.post("/generate-tests-batch", json={
+            "project_id":  "proj_test",
+            "class_names": [],
+        })
+        # Pydantic min_items=1 → 422 Unprocessable Entity
+        assert r.status_code == 422
