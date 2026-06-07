@@ -11,7 +11,5 @@
   "nb_class_grants",
   "nb_constructor_deps",
   "nb_methods_in_class",
-  "method_loc",
-  "git_nb_authors",
-  "git_days_since_change"
+  "method_loc"
 ]
