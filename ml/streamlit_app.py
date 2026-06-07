@@ -1,9 +1,10 @@
-﻿"""
+"""
 Dashboard AI Test Engine — Prédicteur de risque de régression + génération de tests.
 Usage : streamlit run ml/streamlit_app.py
 """
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import joblib
@@ -255,6 +256,62 @@ elif page == "Prédiction ML":
         st.error("Aucun modèle entraîné. Lance d'abord `python ml/train.py _dataset/dataset.csv`")
         st.stop()
 
+    # ── Extraction dataset ────────────────────────────────────────────────────
+    with st.expander("Extraire un dataset depuis un dépôt Symfony git"):
+        st.caption("Lance `extract_dataset.py` directement depuis cette interface.")
+        ex_col1, ex_col2 = st.columns(2)
+        ex_repo = ex_col1.text_input(
+            "Chemin du dépôt git (dans le conteneur)",
+            value="/app/_dataset/sylius",
+            help="Chemin absolu accessible depuis le conteneur Streamlit. "
+                 "Ex: /app/_dataset/sylius ou /workspace/_dataset/mon-projet",
+        )
+        ex_output = ex_col2.text_input(
+            "Nom du fichier CSV de sortie",
+            value="dataset.csv",
+            help="Sera créé dans /app/_dataset/<nom>",
+        )
+        ex_col3, ex_col4, ex_col5 = st.columns(3)
+        ex_since = ex_col3.text_input("--since", value="36 months ago")
+        ex_threshold = ex_col4.number_input("--bugfix-threshold", min_value=1, value=1)
+        ex_feature_set = ex_col5.selectbox("--feature-set (train)", ["v2", "v1", "v3"])
+
+        output_path = f"/app/_dataset/{ex_output}"
+        cmd = (
+            f"python /app/extract_dataset.py {ex_repo} {output_path}"
+            f' --since "{ex_since}" --bugfix-threshold {ex_threshold}'
+        )
+        st.code(cmd, language="bash")
+
+        if st.button("Lancer l'extraction", key="btn_extract"):
+            with st.spinner("Extraction en cours — peut prendre plusieurs minutes…"):
+                try:
+                    result = subprocess.run(
+                        ["python", "/app/extract_dataset.py", ex_repo, output_path,
+                         "--since", ex_since,
+                         "--bugfix-threshold", str(ex_threshold)],
+                        capture_output=True, text=True, timeout=600,
+                        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                    )
+                    if result.returncode == 0:
+                        st.success(f"Dataset extrait : `{output_path}`")
+                        st.text(result.stdout[-3000:] if result.stdout else "")
+                        # Proposer d'enchaîner avec l'entraînement
+                        st.info(
+                            f"Lance maintenant l'entraînement avec :\n"
+                            f"`python /app/train.py {output_path} --feature-set {ex_feature_set}`"
+                        )
+                    else:
+                        st.error("Erreur lors de l'extraction.")
+                        st.code(result.stderr[-2000:])
+                except subprocess.TimeoutExpired:
+                    st.error("Timeout (10 min) — le dépôt est peut-être trop grand.")
+                except Exception as e:
+                    st.error(f"Erreur : {e}")
+
+    st.markdown("---")
+
+    # ── Source de données ─────────────────────────────────────────────────────
     st.markdown('<div class="section-header">Source de données</div>', unsafe_allow_html=True)
     col1, col2 = st.columns([1, 2])
     with col1:
@@ -308,7 +365,7 @@ elif page == "Prédiction ML":
                 font_color="white", height=320,
                 margin=dict(l=10, r=10, t=10, b=10),
             )
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
         else:
             fig, ax = plt.subplots(figsize=(7, 3))
             ax.hist(df["risk_score"], bins=30, color="#4f46e5", edgecolor="black")
@@ -340,7 +397,7 @@ elif page == "Prédiction ML":
                 xaxis_title="Score moyen",
                 margin=dict(l=10, r=60, t=10, b=10),
             )
-            st.plotly_chart(fig2, width="stretch")
+            st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("Colonne `class` absente — graphique non disponible.")
 
@@ -369,9 +426,7 @@ elif page == "Prédiction ML":
 
     with st.expander("Generation rapide depuis ici"):
         risky = (
-            df[df["risk_score_raw"] >= 0.5]["class"].drop_duplicates().tolist()
-            if "risk_score_raw" in df.columns
-            else df[df["risk_pred"] == 1]["class"].drop_duplicates().tolist()
+            df[df["risk_pred"] == 1]["class"].drop_duplicates().tolist()
             if "class" in df.columns else []
         )
         if not risky:
@@ -624,7 +679,7 @@ elif page == "Performance":
                 margin=dict(l=10, r=10, t=40, b=10),
                 yaxis=dict(range=[0, 1.15]),
             )
-            st.plotly_chart(fig_bar, width="stretch")
+            st.plotly_chart(fig_bar, use_container_width=True)
 
         st.dataframe(df_show.map(lambda v: f"{v:.4f}" if isinstance(v, float) else v),
                      width="stretch")
@@ -647,7 +702,7 @@ elif page == "Performance":
                 xaxis_title="Importance",
                 margin=dict(l=10, r=70, t=10, b=10),
             )
-            st.plotly_chart(fig_imp, width="stretch")
+            st.plotly_chart(fig_imp, use_container_width=True)
         else:
             fig, ax = plt.subplots(figsize=(8, 5))
             ax.barh(top15["feature"], top15["importance"], color="#4f46e5")
