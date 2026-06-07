@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>AI Test Engine — Console</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/php.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b27;
+      --card:     #1e2130;
+      --border:   #2d3250;
+      --accent:   #4f46e5;
+      --accent2:  #7c3aed;
+      --success:  #16a34a;
+      --danger:   #dc2626;
+      --warning:  #d97706;
+      --text:     #e2e8f0;
+      --muted:    #8892a4;
+      --radius:   10px;
+    }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+    }
+
+    /* ── Sidebar ── */
+    aside {
+      width: 240px;
+      min-height: 100vh;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      z-index: 100;
+    }
+    .logo {
+      padding: 24px 20px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo h1 { font-size: 1.15rem; font-weight: 700; color: #fff; }
+    .logo p  { font-size: .75rem; color: var(--muted); margin-top: 3px; }
+
+    #api-status {
+      display: flex; align-items: center; gap: 8px;
+      margin: 14px 20px 0;
+      font-size: .8rem; color: var(--muted);
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--danger);
+      transition: background .3s;
+      flex-shrink: 0;
+    }
+    .dot.online { background: var(--success); }
+
+    nav { flex: 1; padding: 12px 0; overflow-y: auto; }
+    nav .section-label {
+      font-size: .68rem; font-weight: 700; letter-spacing: .08em;
+      text-transform: uppercase; color: var(--muted);
+      padding: 10px 20px 4px;
+    }
+    nav a {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 20px;
+      color: var(--muted);
+      text-decoration: none;
+      font-size: .875rem;
+      border-left: 3px solid transparent;
+      transition: all .15s;
+      cursor: pointer;
+    }
+    nav a:hover  { color: var(--text); background: rgba(79,70,229,.1); }
+    nav a.active { color: #fff; border-left-color: var(--accent); background: rgba(79,70,229,.15); }
+    nav a .badge {
+      margin-left: auto; font-size: .7rem; font-weight: 600;
+      padding: 2px 7px; border-radius: 99px;
+    }
+    .badge-get    { background: rgba(22,163,74,.2);  color: #4ade80; }
+    .badge-post   { background: rgba(79,70,229,.25); color: #a5b4fc; }
+    .badge-delete { background: rgba(220,38,38,.2);  color: #fca5a5; }
+
+    /* ── Main ── */
+    main {
+      margin-left: 240px;
+      flex: 1;
+      padding: 32px 40px;
+      max-width: 1000px;
+    }
+
+    .page { display: none; }
+    .page.active { display: block; }
+
+    h2 {
+      font-size: 1.5rem; font-weight: 700; color: #fff;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px; margin-bottom: 20px;
+    }
+    h2 small {
+      display: block; font-size: .8rem; font-weight: 400;
+      color: var(--muted); margin-top: 4px;
+    }
+
+    .method-tag {
+      display: inline-block;
+      font-size: .7rem; font-weight: 700; padding: 3px 8px;
+      border-radius: 5px; margin-right: 8px;
+      text-transform: uppercase;
+    }
+    .get    { background: rgba(22,163,74,.2);  color: #4ade80; }
+    .post   { background: rgba(79,70,229,.25); color: #a5b4fc; }
+    .delete { background: rgba(220,38,38,.2);  color: #fca5a5; }
+
+    /* ── Form ── */
+    .form-group { margin-bottom: 16px; }
+    label {
+      display: block;
+      font-size: .8rem; font-weight: 600; color: var(--muted);
+      margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em;
+    }
+    label span { color: var(--danger); }
+    input[type=text], textarea, select {
+      width: 100%; background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 10px 14px;
+      font-size: .9rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color .2s;
+    }
+    input[type=text]:focus, textarea:focus, select:focus {
+      border-color: var(--accent);
+    }
+    textarea { resize: vertical; min-height: 90px; }
+    .checkbox-row {
+      display: flex; align-items: center; gap: 10px;
+      font-size: .875rem; cursor: pointer;
+    }
+    input[type=checkbox] {
+      width: 16px; height: 16px; cursor: pointer; accent-color: var(--accent);
+    }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 10px 22px; border: none; border-radius: var(--radius);
+      font-size: .9rem; font-weight: 600; cursor: pointer;
+      transition: opacity .2s, transform .1s;
+    }
+    .btn:hover  { opacity: .88; }
+    .btn:active { transform: scale(.97); }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      color: #fff;
+    }
+    .btn-danger  { background: var(--danger); color: #fff; }
+    .btn-ghost   { background: var(--border); color: var(--text); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+    /* ── Response ── */
+    .response-box {
+      margin-top: 24px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .response-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,.03);
+    }
+    .response-header .status-pill {
+      padding: 3px 10px; border-radius: 99px;
+      font-size: .78rem; font-weight: 700;
+    }
+    .status-ok  { background: rgba(22,163,74,.2);  color: #4ade80; }
+    .status-err { background: rgba(220,38,38,.2);  color: #fca5a5; }
+    .response-body { padding: 0; }
+    .response-body pre {
+      margin: 0;
+      max-height: 500px;
+      overflow: auto;
+      font-size: .82rem;
+    }
+    .response-body pre code { border-radius: 0 !important; padding: 16px !important; }
+
+    /* ── Stats cards ── */
+    .stats-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 14px; margin-bottom: 24px;
+    }
+    .stat-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 18px 16px;
+      text-align: center;
+    }
+    .stat-card .value { font-size: 2rem; font-weight: 700; color: #fff; }
+    .stat-card .label { font-size: .78rem; color: var(--muted); margin-top: 4px; }
+
+    /* ── Loader ── */
+    .loader {
+      display: inline-block; width: 18px; height: 18px;
+      border: 2px solid rgba(255,255,255,.2);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Toast */
+    #toast {
+      position: fixed; bottom: 24px; right: 24px;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 12px 18px;
+      font-size: .875rem; max-width: 320px;
+      transform: translateY(80px); opacity: 0;
+      transition: all .3s; z-index: 999;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
+
+    /* Home  */
+    .endpoint-list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+    .endpoint-item {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 14px 16px;
+      cursor: pointer; transition: border-color .2s;
+    }
+    .endpoint-item:hover { border-color: var(--accent); }
+    .endpoint-item .path { font-family: monospace; font-size: .9rem; }
+    .endpoint-item .desc { font-size: .8rem; color: var(--muted); margin-top: 2px; }
+  </style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<aside>
+  <div class="logo">
+    <h1>AI Test Engine</h1>
+    <p>Console API v1.0</p>
+  </div>
+  <div id="api-status">
+    <div class="dot" id="status-dot"></div>
+    <span id="status-text">Vérification…</span>
+  </div>
+  <nav>
+    <div class="section-label">Général</div>
+    <a onclick="show('home')" class="active" id="nav-home">Accueil</a>
+    <a onclick="show('health')" id="nav-health">
+      Health Check <span class="badge badge-get">GET</span>
+    </a>
+
+    <div class="section-label">Projets</div>
+    <a onclick="show('stats')" id="nav-stats">
+      Statistiques <span class="badge badge-get">GET</span>
+    </a>
+    <a onclick="show('index')" id="nav-index">
+      Indexer projet <span class="badge badge-post">POST</span>
+    </a>
+    <a onclick="show('delete')" id="nav-delete">
+      Supprimer projet <span class="badge badge-delete">DEL</span>
+    </a>
+
+    <div class="section-label">Génération</div>
+    <a onclick="show('gen-func')" id="nav-gen-func">
+      Test fonctionnel <span class="badge badge-post">POST</span>
+    </a>
+    <a onclick="show('gen-unit')" id="nav-gen-unit">
+      Test unitaire <span class="badge badge-post">POST</span>
+    </a>
+
+    <div class="section-label">Admin</div>
+    <a onclick="show('reset')" id="nav-reset">
+      Reset DB <span class="badge badge-post">POST</span>
+    </a>
+  </nav>
+</aside>
+
+<!-- Main  -->
+<main>
+
+  <!-- HOME -->
+  <div class="page active" id="page-home">
+    <h2>Bienvenue sur la console AI Test Engine
+      <small>Testez et explorez tous les endpoints de l'API en temps réel.</small>
+    </h2>
+    <div id="home-stats" class="stats-grid">
+      <div class="stat-card">
+        <div class="value" id="home-status">—</div>
+        <div class="label">Statut API</div>
+      </div>
+      <div class="stat-card">
+        <div class="value" id="home-projects">—</div>
+        <div class="label">Projets indexés</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">7</div>
+        <div class="label">Endpoints</div>
+      </div>
+      <div class="stat-card">
+        <div class="value">8000</div>
+        <div class="label">Port</div>
+      </div>
+    </div>
+    <div class="endpoint-list">
+      <div class="endpoint-item" onclick="show('health')">
+        <span class="method-tag get">GET</span>
+        <div><div class="path">/health</div><div class="desc">Vérification de santé de l'API</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('stats')">
+        <span class="method-tag get">GET</span>
+        <div><div class="path">/project/{project_id}/stats</div><div class="desc">Statistiques d'un projet indexé</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('index')">
+        <span class="method-tag post">POST</span>
+        <div><div class="path">/learn-from-code</div><div class="desc">Indexer le code source d'un projet Symfony</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('gen-func')">
+        <span class="method-tag post">POST</span>
+        <div><div class="path">/generate-test</div><div class="desc">Générer un WebTestCase Symfony</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('gen-unit')">
+        <span class="method-tag post">POST</span>
+        <div><div class="path">/generate-unit-test</div><div class="desc">Générer un test unitaire PHPUnit</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('delete')">
+        <span class="method-tag delete">DEL</span>
+        <div><div class="path">/project/{project_id}</div><div class="desc">Supprimer les données d'un projet</div></div>
+      </div>
+      <div class="endpoint-item" onclick="show('reset')">
+        <span class="method-tag post">POST</span>
+        <div><div class="path">/admin/reset-schema</div><div class="desc">Réinitialiser toute la base de données</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HEALTH -->
+  <div class="page" id="page-health">
+    <h2><span class="method-tag get">GET</span>/health
+      <small>Vérifie que l'API et la base vectorielle sont opérationnels.</small>
+    </h2>
+    <button class="btn btn-primary" onclick="runHealth()">
+      <span>▶ Envoyer la requête</span>
+    </button>
+    <div id="res-health"></div>
+  </div>
+
+  <!-- STATS -->
+  <div class="page" id="page-stats">
+    <h2><span class="method-tag get">GET</span>/project/{project_id}/stats
+      <small>Nombre de chunks indexés pour un projet donné.</small>
+    </h2>
+    <div class="form-group">
+      <label>project_id <span>*</span></label>
+      <input type="text" id="stats-pid" placeholder="sucre" value="sucre"/>
+    </div>
+    <button class="btn btn-primary" onclick="runStats()">▶ Envoyer</button>
+    <div id="res-stats"></div>
+  </div>
+
+  <!-- INDEX -->
+  <div class="page" id="page-index">
+    <h2><span class="method-tag post">POST</span>/learn-from-code
+      <small>Analyse le code source du projet Symfony et l'indexe dans pgvector.</small>
+    </h2>
+    <div class="form-group">
+      <label>project_id <span>*</span></label>
+      <input type="text" id="idx-pid" placeholder="sucre" value="sucre"/>
+    </div>
+    <div class="form-group">
+      <label>model_name <span style="color:var(--muted)">(optionnel)</span></label>
+      <input type="text" id="idx-model" placeholder="paraphrase-multilingual-MiniLM-L12-v2"/>
+    </div>
+    <button class="btn btn-primary" onclick="runIndex()">Lancer l'indexation</button>
+    <div id="res-index"></div>
+  </div>
+
+  <!-- DELETE -->
+  <div class="page" id="page-delete">
+    <h2><span class="method-tag delete">DELETE</span>/project/{project_id}
+      <small>Supprime définitivement tous les chunks d'un projet de la base vectorielle.</small>
+    </h2>
+    <div class="form-group">
+      <label>project_id <span>*</span></label>
+      <input type="text" id="del-pid" placeholder="sucre"/>
+    </div>
+    <button class="btn btn-danger" onclick="runDelete()">Supprimer le projet</button>
+    <div id="res-delete"></div>
+  </div>
+
+  <!-- GENERATE FUNC -->
+  <div class="page" id="page-gen-func">
+    <h2><span class="method-tag post">POST</span>/generate-test
+      <small>Génère un WebTestCase Symfony pour une route ou un controller.</small>
+    </h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>project_id <span>*</span></label>
+        <input type="text" id="gf-pid" placeholder="sucre" value="sucre"/>
+      </div>
+      <div class="form-group">
+        <label>class_name</label>
+        <input type="text" id="gf-class" placeholder="ProductController"/>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>description <span>*</span></label>
+      <textarea id="gf-desc" placeholder="Tester la route GET /products avec et sans authentification, vérifier le retour 200 et la structure JSON..."></textarea>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>test_name</label>
+        <input type="text" id="gf-testname" placeholder="ProductControllerTest"/>
+      </div>
+      <div class="form-group">
+        <label>model_name</label>
+        <input type="text" id="gf-model" placeholder="qwen2.5-coder:7b"/>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="checkbox-row">
+        <input type="checkbox" id="gf-det"/>
+        Mode déterministe (sans LLM — template fixe)
+      </label>
+    </div>
+    <button class="btn btn-primary" onclick="runGenFunc()">Générer le test</button>
+    <div id="res-gen-func"></div>
+  </div>
+
+  <!-- GENERATE UNIT -->
+  <div class="page" id="page-gen-unit">
+    <h2><span class="method-tag post">POST</span>/generate-unit-test
+      <small>Génère un test unitaire PHPUnit pour une classe ou méthode spécifique.</small>
+    </h2>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>project_id <span>*</span></label>
+        <input type="text" id="gu-pid" placeholder="sucre" value="sucre"/>
+      </div>
+      <div class="form-group">
+        <label>class_name <span>*</span></label>
+        <input type="text" id="gu-class" placeholder="OrderService"/>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>file_path <span>*</span></label>
+      <input type="text" id="gu-file" placeholder="src/Service/OrderService.php"/>
+    </div>
+    <div class="form-group">
+      <label>description <span>*</span></label>
+      <textarea id="gu-desc" placeholder="Tester que calculateTotal retourne 0 pour un panier vide et la somme correcte pour des articles..."></textarea>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px;">
+      <div class="form-group">
+        <label>method_name</label>
+        <input type="text" id="gu-method" placeholder="calculateTotal"/>
+      </div>
+      <div class="form-group">
+        <label>test_name</label>
+        <input type="text" id="gu-testname" placeholder="OrderServiceTest"/>
+      </div>
+    </div>
+    <div class="form-group">
+      <label>model_name</label>
+      <input type="text" id="gu-model" placeholder="qwen2.5-coder:7b"/>
+    </div>
+    <button class="btn btn-primary" onclick="runGenUnit()">Générer le test</button>
+    <div id="res-gen-unit"></div>
+  </div>
+
+  <!-- RESET -->
+  <div class="page" id="page-reset">
+    <h2><span class="method-tag post">POST</span>/admin/reset-schema
+      <small>Supprime et recrée toutes les tables. Toutes les données sont perdues.</small>
+    </h2>
+    <div style="background:rgba(220,38,38,.1); border:1px solid rgba(220,38,38,.4); border-radius:var(--radius); padding:14px 16px; margin-bottom:20px; font-size:.875rem;">
+      <strong>Attention :</strong> cette action est irréversible. Tous les projets indexés seront supprimés.
+    </div>
+    <div class="form-group">
+      <label class="checkbox-row">
+        <input type="checkbox" id="reset-confirm"/>
+        Je confirme vouloir réinitialiser la base de données
+      </label>
+    </div>
+    <button class="btn btn-danger" onclick="runReset()">Réinitialiser la DB</button>
+    <div id="res-reset"></div>
+  </div>
+
+</main>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+  const API = 'http://localhost:8000';
+
+  // Navigation
+  function show(name) {
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('nav a').forEach(a => a.classList.remove('active'));
+    document.getElementById('page-' + name).classList.add('active');
+    document.getElementById('nav-' + name).classList.add('active');
+  }
+
+  // API Status
+  async function checkStatus() {
+    try {
+      const r = await fetch(`${API}/health`, { signal: AbortSignal.timeout(3000) });
+      const d = await r.json();
+      document.getElementById('status-dot').className = 'dot online';
+      document.getElementById('status-text').textContent = 'API connectée';
+      document.getElementById('home-status').textContent = 'OK';
+      document.getElementById('home-projects').textContent = d.projects_indexed ?? '?';
+    } catch {
+      document.getElementById('status-dot').className = 'dot';
+      document.getElementById('status-text').textContent = 'API hors ligne';
+      document.getElementById('home-status').textContent = 'Off';
+    }
+  }
+  checkStatus();
+  setInterval(checkStatus, 10000);
+
+  // Helpers
+  function toast(msg, ok = true) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.borderColor = ok ? 'var(--success)' : 'var(--danger)';
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 3000);
+  }
+
+  function setLoading(btn, yes) {
+    if (yes) {
+      btn._txt = btn.innerHTML;
+      btn.innerHTML = '<span class="loader"></span> En cours…';
+      btn.disabled = true;
+    } else {
+      btn.innerHTML = btn._txt;
+      btn.disabled = false;
+    }
+  }
+
+  function renderResponse(containerId, status, data, isCode = false) {
+    const ok = status >= 200 && status < 300;
+    let bodyHtml;
+
+    if (isCode && data.code) {
+      const highlighted = hljs.highlight(data.code, { language: 'php' }).value;
+      bodyHtml = `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--border);">
+          <span style="font-size:.8rem;color:var(--muted)">${data.file || 'test.php'}</span>
+          <button class="btn btn-ghost" style="padding:5px 12px;font-size:.8rem;" onclick="copyCode()">Copier</button>
+        </div>
+        <pre id="code-output"><code class="language-php">${highlighted}</code></pre>`;
+    } else {
+      const json = JSON.stringify(data, null, 2);
+      const highlighted = hljs.highlight(json, { language: 'json' }).value;
+      bodyHtml = `<pre><code class="language-json">${highlighted}</code></pre>`;
+    }
+
+    document.getElementById(containerId).innerHTML = `
+      <div class="response-box">
+        <div class="response-header">
+          <span style="font-size:.85rem;color:var(--muted)">Réponse</span>
+          <span class="status-pill ${ok ? 'status-ok' : 'status-err'}">HTTP ${status}</span>
+        </div>
+        <div class="response-body">${bodyHtml}</div>
+      </div>`;
+  }
+
+  function copyCode() {
+    const el = document.getElementById('code-output');
+    if (el) {
+      navigator.clipboard.writeText(el.innerText).then(() => toast('Code copié !'));
+    }
+  }
+
+  async function apiFetch(method, path, body = null) {
+    const opts = {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+    };
+    if (body) opts.body = JSON.stringify(body);
+    const r = await fetch(API + path, opts);
+    const data = await r.json().catch(() => ({}));
+    return { status: r.status, data };
+  }
+
+  // Endpoints
+  async function runHealth() {
+    const btn = event.target;
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('GET', '/health');
+      renderResponse('res-health', status, data);
+      toast(status === 200 ? 'API opérationnelle ' : 'Erreur API', status === 200);
+    } catch(e) { renderResponse('res-health', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runStats() {
+    const btn = event.target;
+    const pid = document.getElementById('stats-pid').value.trim();
+    if (!pid) return toast('project_id requis', false);
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('GET', `/project/${pid}/stats`);
+      renderResponse('res-stats', status, data);
+    } catch(e) { renderResponse('res-stats', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runIndex() {
+    const btn = event.target;
+    const pid   = document.getElementById('idx-pid').value.trim();
+    const model = document.getElementById('idx-model').value.trim();
+    if (!pid) return toast('project_id requis', false);
+    setLoading(btn, true);
+    const body = { project_id: pid };
+    if (model) body.model_name = model;
+    try {
+      const { status, data } = await apiFetch('POST', '/learn-from-code', body);
+      renderResponse('res-index', status, data);
+      toast(status === 200 ? 'Indexation lancée !' : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-index', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runDelete() {
+    const btn = event.target;
+    const pid = document.getElementById('del-pid').value.trim();
+    if (!pid) return toast('project_id requis', false);
+    if (!confirm(`Supprimer le projet "${pid}" ?`)) return;
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('DELETE', `/project/${pid}`);
+      renderResponse('res-delete', status, data);
+      toast(status === 200 ? `Projet ${pid} supprimé` : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-delete', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runGenFunc() {
+    const btn = event.target;
+    const pid   = document.getElementById('gf-pid').value.trim();
+    const desc  = document.getElementById('gf-desc').value.trim();
+    const cls   = document.getElementById('gf-class').value.trim();
+    const tname = document.getElementById('gf-testname').value.trim();
+    const model = document.getElementById('gf-model').value.trim();
+    const det   = document.getElementById('gf-det').checked;
+    if (!pid || !desc) return toast('project_id et description sont requis', false);
+    setLoading(btn, true);
+    const body = { project_id: pid, description: desc, deterministic: det };
+    if (cls)   body.class_name = cls;
+    if (tname) body.test_name  = tname;
+    if (model) body.model_name = model;
+    try {
+      const { status, data } = await apiFetch('POST', '/generate-test', body);
+      renderResponse('res-gen-func', status, data, true);
+      toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-gen-func', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runGenUnit() {
+    const btn = event.target;
+    const pid   = document.getElementById('gu-pid').value.trim();
+    const cls   = document.getElementById('gu-class').value.trim();
+    const file  = document.getElementById('gu-file').value.trim();
+    const desc  = document.getElementById('gu-desc').value.trim();
+    const meth  = document.getElementById('gu-method').value.trim();
+    const tname = document.getElementById('gu-testname').value.trim();
+    const model = document.getElementById('gu-model').value.trim();
+    if (!pid || !cls || !file || !desc) return toast('project_id, class_name, file_path et description sont requis', false);
+    setLoading(btn, true);
+    const body = { project_id: pid, class_name: cls, file_path: file, description: desc };
+    if (meth)  body.method_name = meth;
+    if (tname) body.test_name   = tname;
+    if (model) body.model_name  = model;
+    try {
+      const { status, data } = await apiFetch('POST', '/generate-unit-test', body);
+      renderResponse('res-gen-unit', status, data, true);
+      toast(status === 200 ? 'Test généré !' : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-gen-unit', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+
+  async function runReset() {
+    const btn = event.target;
+    const confirmed = document.getElementById('reset-confirm').checked;
+    if (!confirmed) return toast('Cochez la case de confirmation', false);
+    setLoading(btn, true);
+    try {
+      const { status, data } = await apiFetch('POST', '/admin/reset-schema', { confirm: true });
+      renderResponse('res-reset', status, data);
+      toast(status === 200 ? 'DB réinitialisée' : `Erreur ${status}`, status === 200);
+    } catch(e) { renderResponse('res-reset', 0, { error: e.message }); }
+    setLoading(btn, false);
+  }
+</script>
+</body>
+</html>

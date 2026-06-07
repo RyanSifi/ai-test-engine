@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
+from pathlib import Path
 import requests
 import re
 from pydantic import BaseModel, Field
@@ -16,17 +18,13 @@ from config import settings
 from brain import SemanticEngine
 from db import KnowledgeDB
 
-# ---------------------------------------------------------------------------
 # LOGGING
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# ---------------------------------------------------------------------------
 # DÉPENDANCES (singletons mis en cache)
-# ---------------------------------------------------------------------------
 
 @lru_cache
 def get_db() -> KnowledgeDB:
@@ -88,9 +86,7 @@ async def lifespan(app: FastAPI):
     logging.info("Arrêt de l'application.")
 
 
-# ---------------------------------------------------------------------------
 # APPLICATION FASTAPI
-# ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Moteur de Test IA",
@@ -109,21 +105,25 @@ app = FastAPI(
     ],
 )
 
-# CORS — activé seulement si configuré dans le .env
+# CORS — toujours activé pour autoriser la console HTML (localhost)
 _cors_origins = [o.strip() for o in (settings.cors_origins or "").split(",") if o.strip()]
-if _cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["X-API-Key", "Content-Type"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins if _cors_origins else ["*"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["X-API-Key", "Content-Type"],
+)
+
+# Console HTML
+_STATIC_DIR = Path(__file__).parent / "static"
+
+@app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
+async def console_ui():
+    """Console web interactive pour l'API."""
+    return (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
 # MODÈLES PYDANTIC
-# ---------------------------------------------------------------------------
-
 # Contraintes communes pour bloquer les inputs farfelus avant qu'ils n'atteignent
 # les colonnes VARCHAR(100) de la DB ou l'écriture de fichiers.
 _PROJECT_ID_PATTERN = r"^[a-zA-Z0-9_.-]+$"
@@ -177,9 +177,7 @@ class ResetSchemaRequest(BaseModel):
 
 
 
-# ---------------------------------------------------------------------------
 # HELPERS
-# ---------------------------------------------------------------------------
 
 def validate_php_syntax(code: str) -> Optional[str]:
     """Valide la syntaxe PHP. Retourne le message d'erreur ou None si OK."""
@@ -274,7 +272,7 @@ def _call_llm(prompt: str, timeout: int = 600, _skip_health: bool = False) -> st
         prompt = prompt[:MAX_PROMPT_CHARS]
 
     estimated_tokens = len(prompt) // 3
-    logging.info(f"[_call_llm] ~{estimated_tokens} tokens estimés, num_ctx=8192")
+    logging.info(f"[_call_llm] ~{estimated_tokens} tokens estimés, num_ctx={settings.llm_num_ctx}")
     if estimated_tokens > 6500:
         logging.warning("[_call_llm] Prompt dépasse 6500 tokens — risque de troncature LLM")
 
@@ -284,11 +282,14 @@ def _call_llm(prompt: str, timeout: int = 600, _skip_health: bool = False) -> st
             "model":  settings.default_llm_model,
             "prompt": prompt,
             "stream": True,
+            # keep_alive est un champ de premier niveau (pas dans options) : il
+            # garde le modèle en RAM entre deux appels → pas de rechargement.
+            "keep_alive": settings.llm_keep_alive,
             "options": {
                 "temperature":  0.1,
                 "stop":         ["<|im_end|>"],
-                "num_ctx":      8192,
-                "num_predict":  1500,
+                "num_ctx":      settings.llm_num_ctx,
+                "num_predict":  settings.llm_num_predict,
             },
         },
         stream=True,
@@ -476,10 +477,7 @@ def filter_chunks_by_class(chunks: List[Dict], class_name: str) -> List[Dict]:
     return primary + secondary[:3]
 
 
-# ---------------------------------------------------------------------------
 # GÉNÉRATEUR DÉTERMINISTE — bypass LLM pour les WebTestCase
-# ---------------------------------------------------------------------------
-
 # Regex pour parser le contenu des chunks de méthode enrichis
 _RE_METHOD_NAME   = re.compile(r"Méthode '([^']+)'")
 _RE_ROUTE         = re.compile(r"Route:\s*([^\s—\n]+)")
@@ -866,9 +864,7 @@ final class {fixtures_class_name} extends Fixture
     return php
 
 
-# ---------------------------------------------------------------------------
 # MOTEUR DE SCÉNARIOS
-# ---------------------------------------------------------------------------
 
 def _parse_chunk_metadata(content: str, raw_route: str, class_role: str) -> Dict:
     """
@@ -930,13 +926,11 @@ def _render_scenario(sc: Dict) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
 # BUILDERS DE SCÉNARIOS — chaque builder retourne 0..N scénarios
 #
 # Pour ajouter un nouveau pattern de test :
-#   1. Écrire une fonction (ctx, fw, redirect, code, sec_roles) -> List[Dict]
-#   2. L'ajouter à SCENARIO_BUILDERS en bas de cette section
-# ---------------------------------------------------------------------------
+#   Écrire une fonction (ctx, fw, redirect, code, sec_roles) -> List[Dict]
+#   L'ajouter à SCENARIO_BUILDERS en bas de cette section
 
 def _scenario_noauth(ctx, fw, redirect_path, redirect_code, _sec_roles):
     """Non authentifié → redirect vers le SSO."""
@@ -1199,7 +1193,7 @@ def _scenario_secondary_role(ctx, fw, _rp, _rc, sec_roles):
     return results
 
 
-# ── Registre des builders ─────────────────────────────────────────────────
+# Registre des builders
 # L'ordre n'a PAS d'importance fonctionnelle (il détermine juste l'ordre
 # des tests dans le fichier PHP). Ajouter un builder ici = nouveau pattern.
 
@@ -1215,9 +1209,7 @@ SCENARIO_BUILDERS = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # ENDPOINTS — SANTÉ ET ADMINISTRATION
-# ---------------------------------------------------------------------------
 
 @app.get("/health", summary="Vérification de santé", tags=["santé"])
 async def health_check(db: KnowledgeDB = Depends(get_db)):
@@ -1231,6 +1223,20 @@ async def health_check(db: KnowledgeDB = Depends(get_db)):
         }
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB non disponible : {e}")
+
+
+@app.get(
+    "/projects",
+    summary="Liste les projets indexés",
+    tags=["projets"],
+    dependencies=[Depends(require_api_key)],
+)
+async def list_projects(db: KnowledgeDB = Depends(get_db)):
+    """Retourne la liste des project_id présents dans la base vectorielle."""
+    try:
+        return db.list_projects()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get(
@@ -1291,9 +1297,21 @@ def reset_schema(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINT — APPRENTISSAGE
-# ---------------------------------------------------------------------------
+@app.post(
+    "/index-project",
+    summary="Alias pour /learn-from-code",
+    tags=["indexation"],
+    dependencies=[Depends(require_api_key)],
+    include_in_schema=False,
+)
+def index_project_alias(
+    data: LearnFromCodeRequest,
+    db: KnowledgeDB = Depends(get_db),
+):
+    return learn_from_code(data, db)
+
+
+# ENDPOINT — GÉNÉRATION DE TEST FONCTIONNEL
 
 @app.post(
     "/learn-from-code",
@@ -1335,7 +1353,7 @@ def learn_from_code(
             tpl["file"]: tpl for tpl in analysis.get("templates", [])
         }
 
-        # ── Chunks PHP (contrôleurs, entités, services, etc.) ──────────────
+        # Chunks PHP (contrôleurs, entités, services, etc.)
         for category, items in analysis.items():
             if category == "templates":
                 continue
@@ -1509,7 +1527,7 @@ def learn_from_code(
                 "project_id": project_id,
             }
 
-        # ── Encodage + sauvegarde ───────────────────────────────────────────
+        # Encodage + sauvegarde
         vectors = brain.encode([c["content"] for c in chunks])
         db.init_schema(vector_size=len(vectors[0]))
         # Ré-indexation atomique : delete + insert dans la même transaction
@@ -1530,9 +1548,7 @@ def learn_from_code(
         logging.error(f"[learn-from-code] Erreur : {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-# ---------------------------------------------------------------------------
 # ENDPOINT — GÉNÉRATION DE TEST FONCTIONNEL
-# ---------------------------------------------------------------------------
 
 @app.post(
     "/generate-test",
@@ -1747,7 +1763,13 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
         gen_time = time.time() - start_time
 
         missing_routes = _validate_coverage(code, context_chunks)
-        if missing_routes:
+        if missing_routes and len(missing_routes) > settings.llm_coverage_retry_max:
+            logging.warning(
+                f"[generate-test] {len(missing_routes)} routes non couvertes — "
+                f"retry de couverture ignoré (> {settings.llm_coverage_retry_max}). "
+                "Génère par méthode/sous-ensemble pour une couverture complète."
+            )
+        elif missing_routes:
             logging.warning(f"[generate-test] Routes non couvertes : {missing_routes}")
             fix_prompt = _build_prompt(
                 system_message,
@@ -1793,9 +1815,7 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
 # ENDPOINT — GÉNÉRATION DE TEST UNITAIRE
-# ---------------------------------------------------------------------------
 
 @app.post(
     "/generate-unit-test",

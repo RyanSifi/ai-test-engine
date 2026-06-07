@@ -41,7 +41,7 @@ def build_dataset() -> list:
     factory_short = factory.split("\\")[-1]
     sso_short     = sso.split("\\")[-1]
 
-    # ── Boilerplate setUp commun ────────────────────────────────────────────
+    # Boilerplate setUp commun
     def boilerplate(class_name: str) -> str:
         return f"""<?php
 
@@ -69,9 +69,7 @@ final class {class_name} extends WebTestCase
         return $this->testUserFactory->create($key);
     }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 1 — CRUD simple : render + redirect + json
-    # ══════════════════════════════════════════════════════════════════════
     context_1 = [
         f"Méthode 'index' (CreanceController) — Route: /creance/ — Template: creance/index.html.twig\n  → Type de réponse: render (200)\n  → H1: Liste des créances",
         f"Méthode 'show' (CreanceController) — Route: /creance/{{id}} — Template: creance/show.html.twig\n  → Type de réponse: render (200)",
@@ -149,9 +147,7 @@ final class {class_name} extends WebTestCase
     }}
 }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 2 — Route AJAX : test avec et sans header XHR
-    # ══════════════════════════════════════════════════════════════════════
     context_2 = [
         f"Méthode 'getDetails' (DossierController) — Route: /dossier/{{id}}/details — Params: (int $id, Request $request)\n  → Type de réponse: json (200)\n  → AJAX uniquement\n  → Verbes HTTP: GET",
         f"La classe PHP DossierController (type: controllers) dans Controller/DossierController.php. → Profil: api → Rôles classe: {primary}",
@@ -185,9 +181,7 @@ final class {class_name} extends WebTestCase
     }}
 }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 3 — Formulaire : GET affiche, POST soumet et redirige
-    # ══════════════════════════════════════════════════════════════════════
     context_3 = [
         f"Méthode 'edit' (ParcoursController) — Route: /parcours/{{id}}/edit — Params: (int $id, Request $request) — Template: parcours/edit.html.twig\n  → Type de réponse: render (200), redirect (302)\n  → Formulaire: ParcoursType\n  → Verbes HTTP: GET, POST\n  → H1: Modifier le parcours",
         f"La classe PHP ParcoursController (type: controllers) dans Controller/ParcoursController.php. → Profil: web_crud → Rôles classe: {primary}",
@@ -221,9 +215,7 @@ final class {class_name} extends WebTestCase
     }}
 }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 4 — Rôle méthode spécifique : test 403 rôle insuffisant
-    # ══════════════════════════════════════════════════════════════════════
     context_4 = [
         f"Méthode 'index' (ParametrageController) — Route: /parametrage/ — Template: parametrage/index.html.twig\n  → Type de réponse: render (200)\n  → H1: Paramétrage",
         f"Méthode 'delete' (ParametrageController) — Route: /parametrage/{{id}}/delete — Params: (int $id)\n  → Type de réponse: redirect (302)\n  → Rôle requis (méthode): {primary}\n  → Verbes HTTP: DELETE",
@@ -274,9 +266,7 @@ final class {class_name} extends WebTestCase
     }}
 }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 5 — Contrôleur mixte : render + json dans le même contrôleur
-    # ══════════════════════════════════════════════════════════════════════
     context_5 = [
         f"Méthode 'index' (TableauBordController) — Route: /tableau-bord/ — Template: tableau-bord/index.html.twig\n  → Type de réponse: render (200)\n  → H1: Tableau de bord",
         f"Méthode 'stats' (TableauBordController) — Route: /tableau-bord/stats\n  → Type de réponse: json (200)",
@@ -320,9 +310,7 @@ final class {class_name} extends WebTestCase
     }}
 }}"""
 
-    # ══════════════════════════════════════════════════════════════════════
     # Exemple 6 — Route sans type de réponse détecté → assertResponseIsSuccessful
-    # ══════════════════════════════════════════════════════════════════════
     context_6 = [
         f"Méthode 'clearCache' (CacheController) — Route: /cache/clear\n  → response (200)",
         f"La classe PHP CacheController (type: controllers) dans Controller/CacheController.php. → Profil: web_crud → Rôles classe: {primary}",
@@ -413,7 +401,7 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
 
-    print(f"✓ {len(dataset)} exemple(s) généré(s) → {args.output}")
+    print(f"{len(dataset)} exemple(s) généré(s) → {args.output}")
     print(f"  firewall={settings.auth_firewall_name}")
     print(f"  redirect={settings.auth_redirect_path} ({settings.auth_redirect_status})")
     print(f"  rôles={settings.auth_test_roles}")

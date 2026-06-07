@@ -18,10 +18,7 @@ from code_parser import (
     _find_class_block,
 )
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
-
 # Chemins des fixtures contrôlables via env vars (CI / autre poste).
 # Par défaut : tests/fixtures/ relatif à ce fichier.
 _FIXTURES_DIR = os.environ.get(
@@ -58,19 +55,17 @@ def test(name, condition, detail=""):
     global PASSED, FAILED, ERRORS
     if condition:
         PASSED += 1
-        print(f"  ✓ {name}")
+        print(f"  {name}")
     else:
         FAILED += 1
-        msg = f"  ✗ {name}"
+        msg = f"  {name}"
         if detail:
             msg += f"  →  {detail}"
         print(msg)
         ERRORS.append(name)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 1. TESTS UNITAIRES : _extract_http_methods
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── _extract_http_methods ──")
 
@@ -90,9 +85,7 @@ test("no methods → empty list",
 test("double quotes",
      _extract_http_methods('#[Route("/foo", methods: ["PUT", "PATCH"])]') == ["PUT", "PATCH"])
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 2. TESTS UNITAIRES : _extract_isgranted_from_attrs
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── _extract_isgranted_from_attrs ──")
 
@@ -112,9 +105,7 @@ test("phpdoc @IsGranted", len(r) == 1 and r[0]["role"] == "ROLE_EDITOR")
 test("no IsGranted → empty",
      _extract_isgranted_from_attrs("#[Route('/foo')]") == [])
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 3. TESTS UNITAIRES : _extract_all_routes
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── _extract_all_routes ──")
 
@@ -135,9 +126,7 @@ test("route with prefix", r[0]["path"] == "/creance/{id}/edit", f"got {r[0]['pat
 test("no route → empty",
      _extract_all_routes("#[IsGranted('ROLE_ADMIN')]", "/foo") == [])
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 4. TESTS UNITAIRES : _analyze_method_body
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── _analyze_method_body ──")
 
@@ -205,9 +194,7 @@ body = "{ set_time_limit(0); return $result; }"
 r = _analyze_method_body(body)
 test("no response type for internal", r["response_types"] == [])
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 5. INTÉGRATION : CreanceController réel
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── CreanceController (intégration) ──")
 
@@ -275,9 +262,7 @@ test("exportDownload is file_download",
 test("legacy route field", index["route"] is not None)
 test("legacy response_type field", index["response_type"] is not None)
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 6. INTÉGRATION : EtatImportController réel
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── EtatImportController (intégration) ──")
 
@@ -304,9 +289,7 @@ st = next(m for m in et["methods"] if m["name"] == "startTreatment")
 test("startTreatment no response_types", st["response_types"] == [], f"got {st['response_types']}")
 test("startTreatment return_type is int", st["return_type"] == "int")
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 7. _classify_controller
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── _classify_controller ──")
 
@@ -336,16 +319,14 @@ test("mixed render+json → mixed",
          {"name": "d", "routes": [{"path": "/d"}], "response_types": ["json (200)"]},
      ], []) == "mixed")
 
-# ═══════════════════════════════════════════════════════════════════════════
 # 8. NON-RÉGRESSION
-# ═══════════════════════════════════════════════════════════════════════════
 
 print("\n── Non-régression ──")
 
 test("balanced block",
      _extract_balanced_block("{ if ($x) { return $x; } }", 0) == "{ if ($x) { return $x; } }")
 
-# ── Tests du fix commentaires ──
+# Tests du fix commentaires
 test("comment // avec apostrophe",
      _extract_balanced_block("{ // l'input est 'final'\n return 1; }", 0) is not None)
 
@@ -380,9 +361,7 @@ class Foo extends Bar
 block = _find_class_block(php, "Foo")
 test("find_class_block", block is not None and "private int $x" in block and block.count("{") == block.count("}"))
 
-# ═══════════════════════════════════════════════════════════════════════════
 # RÉSULTAT
-# ═══════════════════════════════════════════════════════════════════════════
 
 print(f"\n{'='*60}")
 print(f"RÉSULTAT :  {PASSED} passés,  {FAILED} échoués")

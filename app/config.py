@@ -7,7 +7,17 @@ class Settings(BaseSettings):
     database_url: str
     ollama_url: str = "http://host.docker.internal:11434/api/generate"
     default_embedding_model: str = 'paraphrase-multilingual-MiniLM-L12-v2'
-    default_llm_model: str = 'qwen2.5-coder:7b'
+    default_llm_model: str = 'qwen2.5-coder:3b'
+    # Réglages d'inférence LLM (surchargeables via .env). Sur CPU, num_predict est
+    # le principal facteur de temps : ~2,5 tok/s → 1500 tokens ≈ 10 min/appel.
+    llm_num_ctx: int = 8192
+    llm_num_predict: int = 1500
+    # keep_alive : durée pendant laquelle Ollama garde le modèle en RAM après un
+    # appel. "-1" = ne décharge jamais (évite de recharger 4,3 Gio à chaque appel).
+    llm_keep_alive: str = "30m"
+    # Au-delà de ce nombre de routes manquantes, on NE relance PAS la couverture :
+    # régénérer tout le fichier ne comblera pas 30 routes et double juste le temps.
+    llm_coverage_retry_max: int = 6
     # Allowlist de modèles d'embedding chargeables via /learn-from-code et /generate-test.
     # Empêche un appelant de forcer le téléchargement d'un modèle arbitraire depuis HuggingFace.
     # Format CSV. Le default_embedding_model est toujours autorisé implicitement.
