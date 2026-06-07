@@ -32,48 +32,202 @@ TEST_ENGINE_API_KEY = os.environ.get("TEST_ENGINE_API_KEY", "")
 
 st.set_page_config(
     page_title="AI Test Engine",
-    page_icon="",
+    page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# CSS
+# ── CSS — système de design CNAM / Bootstrap 5 ───────────────────────────────
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"] { background: #0f1117; }
-[data-testid="stSidebar"] { background: #161b27; border-right: 1px solid #2d3250; }
+@import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&display=swap');
 
+/* ── Police globale ── */
+html, body, [class*="css"], * {
+    font-family: 'Source Sans 3', 'Source Sans Pro', 'Segoe UI', system-ui, sans-serif !important;
+    font-size: 0.92rem;
+}
+
+/* ── Fond général (bg-gray-eee) ── */
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+.main { background: #EEEEEE !important; }
+
+/* ── Sidebar — blanche avec bordure droite ── */
+[data-testid="stSidebar"] {
+    background: #FFFFFF !important;
+    border-right: 1px solid #DEE2E6 !important;
+}
+[data-testid="stSidebar"] .stMarkdown,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] p { color: #212529 !important; }
+[data-testid="stSidebarNav"] a { color: #212529 !important; }
+[data-testid="stSidebarNav"] a:hover { color: #0084B2 !important; }
+
+/* ── Metric cards ── */
 [data-testid="metric-container"] {
-    background: #1e2130;
-    border: 1px solid #2d3250;
-    border-radius: 10px;
-    padding: 16px;
+    background: #FFFFFF;
+    border: 1px solid #DEE2E6;
+    border-radius: 0;
+    padding: 16px 20px;
 }
-[data-testid="stMetricValue"] { font-size: 2rem !important; font-weight: 700; }
+[data-testid="stMetricValue"] {
+    font-size: 1.8rem !important;
+    font-weight: 700 !important;
+    color: #0084B2 !important;
+}
+[data-testid="stMetricLabel"] { color: #6C757D !important; font-size: 0.82rem !important; }
 
+/* ── Titres ── */
+h1 { font-size: 1.5rem !important; font-weight: 600 !important; color: #212529 !important;
+     border-bottom: 2px solid #0084B2; padding-bottom: 8px; margin-bottom: 16px !important; }
+h2 { font-size: 1.2rem !important; font-weight: 600 !important; color: #212529 !important; }
+h3 { font-size: 1.05rem !important; font-weight: 600 !important; color: #212529 !important; }
+
+/* ── Section headers (barre cyan CNAM) ── */
 .section-header {
-    background: linear-gradient(90deg, #4f46e5, #7c3aed);
-    color: white;
-    padding: 10px 18px;
-    border-radius: 8px;
-    font-size: 1.1rem;
+    background: #0084B2;
+    color: #FFFFFF;
+    padding: 8px 16px;
+    border-radius: 0;
+    font-size: 0.92rem;
     font-weight: 600;
-    margin: 18px 0 12px 0;
+    margin: 18px 0 10px 0;
+    letter-spacing: .02em;
+    text-transform: uppercase;
 }
 
-.dot-green { display:inline-block; width:10px; height:10px; border-radius:50%; background:#16a34a; margin-right:6px; }
-.dot-red   { display:inline-block; width:10px; height:10px; border-radius:50%; background:#dc2626; margin-right:6px; }
+/* ── Indicateurs statut ── */
+.dot-green { display:inline-block; width:10px; height:10px; border-radius:50%;
+             background:#198754; margin-right:6px; }
+.dot-red   { display:inline-block; width:10px; height:10px; border-radius:50%;
+             background:#DC3545; margin-right:6px; }
 
+/* ── Boutons ── */
 .stButton > button {
-    background: linear-gradient(135deg, #4f46e5, #7c3aed);
-    color: white;
-    border: none;
-    border-radius: 8px;
-    font-weight: 600;
-    padding: 10px 24px;
-    transition: opacity .2s;
+    background: #0084B2 !important;
+    color: #FFFFFF !important;
+    border: none !important;
+    border-radius: 0 !important;
+    font-weight: 600 !important;
+    padding: 8px 20px !important;
+    font-size: 0.9rem !important;
+    transition: background .15s ease;
+    width: fit-content !important;
 }
-.stButton > button:hover { opacity: .85; }
+.stButton > button:hover {
+    background: #006A91 !important;
+    color: #FFFFFF !important;
+}
+.stButton > button:focus {
+    box-shadow: 0 0 0 3px rgba(0,132,178,.25) !important;
+    outline: none !important;
+}
+
+/* ── Inputs / Textareas / Selects ── */
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-baseweb="select"] [data-testid="stSelectbox"],
+div[data-baseweb="input"] input {
+    border: 1px solid #CED4DA !important;
+    border-radius: 0 !important;
+    font-size: 0.9rem !important;
+    color: #212529 !important;
+    background: #FFFFFF !important;
+}
+[data-testid="stTextInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {
+    border-color: #0084B2 !important;
+    box-shadow: 0 0 0 2px rgba(0,132,178,.2) !important;
+    outline: none !important;
+}
+
+/* ── Checkbox ── */
+[data-testid="stCheckbox"] label { color: #212529 !important; }
+[data-testid="stCheckbox"] svg { color: #0084B2 !important; }
+
+/* ── Onglets (tabs) ── */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    border-bottom: 2px solid #DEE2E6 !important;
+    background: transparent !important;
+    gap: 0 !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    border-radius: 0 !important;
+    font-weight: 600 !important;
+    color: #6C757D !important;
+    padding: 8px 16px !important;
+    border: none !important;
+    background: transparent !important;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    color: #0084B2 !important;
+    border-bottom: 2px solid #0084B2 !important;
+    background: transparent !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab-panel"] {
+    background: #FFFFFF;
+    border: 1px solid #DEE2E6;
+    border-top: none;
+    padding: 20px 16px !important;
+}
+
+/* ── Expanders ── */
+[data-testid="stExpander"] {
+    border: 1px solid #DEE2E6 !important;
+    border-radius: 0 !important;
+    background: #FFFFFF !important;
+}
+[data-testid="stExpander"] summary {
+    font-weight: 600 !important;
+    color: #212529 !important;
+}
+
+/* ── DataFrames ── */
+[data-testid="stDataFrame"] {
+    border: 1px solid #DEE2E6;
+    border-radius: 0;
+}
+
+/* ── Alertes ── */
+[data-testid="stAlert"] {
+    border-radius: 0 !important;
+    font-size: 0.9rem !important;
+}
+[data-testid="stSuccess"] { background: #D1E7DD !important; color: #0A3622 !important;
+                             border-left: 4px solid #198754 !important; }
+[data-testid="stError"]   { background: #F8D7DA !important; color: #58151C !important;
+                             border-left: 4px solid #DC3545 !important; }
+[data-testid="stWarning"] { background: #FFF3CD !important; color: #664D03 !important;
+                             border-left: 4px solid #FFC107 !important; }
+[data-testid="stInfo"]    { background: #CFF4FC !important; color: #055160 !important;
+                             border-left: 4px solid #0084B2 !important; }
+
+/* ── Spinner ── */
+[data-testid="stSpinner"] p { color: #212529 !important; }
+
+/* ── Formulaires — fond blanc ── */
+[data-testid="stForm"] {
+    background: #FFFFFF;
+    border: 1px solid #DEE2E6;
+    border-radius: 0;
+    padding: 20px !important;
+}
+
+/* ── Code blocks ── */
+[data-testid="stCode"] {
+    border: 1px solid #DEE2E6;
+    border-radius: 0;
+}
+
+/* ── Dividers ── */
+hr { border-color: #DEE2E6 !important; }
+
+/* ── Texte général ── */
+p, div, span, label { color: #212529; }
+a { color: #0084B2 !important; }
+a:hover { color: #006A91 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -139,32 +293,48 @@ def check_api() -> bool:
 
 # Sidebar
 with st.sidebar:
-    st.markdown("## AI Test Engine")
-    st.markdown("---")
+    st.markdown("""
+<div style="background:#0084B2;margin:-1rem -1rem 0 -1rem;padding:18px 20px 14px;">
+  <div style="color:#fff;font-size:1.05rem;font-weight:700;letter-spacing:.01em;">AI Test Engine</div>
+  <div style="color:rgba(255,255,255,.75);font-size:0.78rem;margin-top:2px;">Dashboard & génération de tests</div>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
 
     api_ok = check_api()
     dot = '<span class="dot-green"></span>' if api_ok else '<span class="dot-red"></span>'
     status_txt = "API connectée" if api_ok else "API hors ligne"
-    st.markdown(f"{dot}<small>{status_txt} — {TEST_ENGINE_URL}</small>", unsafe_allow_html=True)
-    st.markdown("---")
+    st.markdown(
+        f'<div style="padding:6px 0;border-bottom:1px solid #DEE2E6;margin-bottom:10px;">'
+        f'{dot}<small style="color:#212529;">{status_txt}</small></div>',
+        unsafe_allow_html=True
+    )
 
     page = st.radio(
         "Navigation",
         ["Accueil", "Prédiction ML", "Génération de tests", "Performance"],
         label_visibility="collapsed",
     )
-    st.markdown("---")
+    st.markdown("<hr style='margin:12px 0;border-color:#DEE2E6'>", unsafe_allow_html=True)
     st.caption(f"Modèle : `best_model.pkl`")
-    st.caption(f"Dataset : `_dataset/`")
+    st.caption(f"API : `{TEST_ENGINE_URL}`")
 
 model, FEATURES = load_model()
 
 
 # PAGE : ACCUEIL
 if page == "Accueil":
-    st.markdown("# AI Test Engine")
-    st.markdown("**Prédicteur de risque de régression + génération de tests Symfony**")
-    st.markdown("---")
+    st.markdown("""
+<div style="background:#FFFFFF;border-bottom:2px solid #0084B2;padding:14px 20px 12px;
+            margin:-1rem -1rem 20px -1rem;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:1.6rem;color:#0084B2;">🧪</span>
+  <div>
+    <div style="font-size:1.2rem;font-weight:700;color:#212529;">AI Test Engine</div>
+    <div style="font-size:0.82rem;color:#6C757D;">Prédicteur de risque de régression · Génération de tests Symfony</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
     metrics = load_metrics()
     best_auc = metrics["best"].get("cv_auc_mean", metrics["best"].get("auc", 0)) if metrics else 0
@@ -249,8 +419,16 @@ Dépôt Symfony indexé
 
 # PAGE : PRÉDICTION ML
 elif page == "Prédiction ML":
-    st.markdown("# Prédiction ML")
-    st.caption("Chargez un dataset CSV produit par `extract_dataset.py` pour obtenir les scores de risque.")
+    st.markdown("""
+<div style="background:#FFFFFF;border-bottom:2px solid #0084B2;padding:14px 20px 12px;
+            margin:-1rem -1rem 20px -1rem;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:1.6rem;color:#0084B2;">📊</span>
+  <div>
+    <div style="font-size:1.2rem;font-weight:700;color:#212529;">Prédiction ML</div>
+    <div style="font-size:0.82rem;color:#6C757D;">Chargez un dataset CSV produit par <code>extract_dataset.py</code></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
     if model is None:
         st.error("Aucun modèle entraîné. Lance d'abord `python ml/train.py _dataset/dataset.csv`")
@@ -464,8 +642,16 @@ elif page == "Prédiction ML":
 
 # PAGE : GÉNÉRATION DE TESTS
 elif page == "Génération de tests":
-    st.markdown("# Génération de tests")
-    st.caption("Interface complète vers l'API FastAPI du AI Test Engine.")
+    st.markdown("""
+<div style="background:#FFFFFF;border-bottom:2px solid #0084B2;padding:14px 20px 12px;
+            margin:-1rem -1rem 20px -1rem;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:1.6rem;color:#0084B2;">⚙️</span>
+  <div>
+    <div style="font-size:1.2rem;font-weight:700;color:#212529;">Génération de tests</div>
+    <div style="font-size:0.82rem;color:#6C757D;">Interface complète vers l'API FastAPI du AI Test Engine</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
     if not api_ok:
         st.warning(f"L'API est hors ligne. Lance : `docker compose up -d`")
@@ -706,7 +892,16 @@ elif page == "Génération de tests":
 
 # PAGE : PERFORMANCE
 elif page == "Performance":
-    st.markdown("# Performance du modèle")
+    st.markdown("""
+<div style="background:#FFFFFF;border-bottom:2px solid #0084B2;padding:14px 20px 12px;
+            margin:-1rem -1rem 20px -1rem;display:flex;align-items:center;gap:14px;">
+  <span style="font-size:1.6rem;color:#0084B2;">📈</span>
+  <div>
+    <div style="font-size:1.2rem;font-weight:700;color:#212529;">Performance du modèle</div>
+    <div style="font-size:0.82rem;color:#6C757D;">Métriques de validation croisée et matrices de confusion</div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
     metrics = load_metrics()
     if metrics is None:
