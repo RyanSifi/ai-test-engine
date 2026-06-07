@@ -48,7 +48,7 @@ services:
       DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
       OLLAMA_URL:               http://host.docker.internal:11434/api/generate
       DEFAULT_EMBEDDING_MODEL:  paraphrase-multilingual-MiniLM-L12-v2
-      DEFAULT_LLM_MODEL:        qwen2.5-coder:7b
+      DEFAULT_LLM_MODEL:        qwen2.5-coder:3b
       # CONTAINER_PROJECT_ROOT est /workspace par defaut (voir config.py)
       # Surcharger ici seulement si le projet n'est pas le dossier parent direct :
       # CONTAINER_PROJECT_ROOT: /workspace/mon-sous-dossier
@@ -84,6 +84,13 @@ services:
     environment:
       DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
       OLLAMA_URL:               http://host.docker.internal:11434/api/generate
+      TEST_ENGINE_URL:          http://brain-api:8000
+    command: >
+      streamlit run streamlit_app.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --server.fileWatcherType none
+      --server.headless true
     depends_on:
       - brain-api
     extra_hosts:
