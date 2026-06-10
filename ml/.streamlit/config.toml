@@ -1,0 +1,15 @@
+[theme]
+base = "light"
+primaryColor = "#0084B2"
+backgroundColor = "#EEEEEE"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#212529"
+font = "sans serif"
+
+[client]
+# Masque la barre développeur (bouton "Deploy", menu) — rendu propre type appli interne
+toolbarMode = "minimal"
+
+[server]
+# Le watcher est désactivé côté docker-compose ; on garde un rechargement manuel
+runOnSave = false
