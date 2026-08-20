@@ -9,7 +9,7 @@ littérature en software defect prediction (Hassan 2009, Kamei et al. 2013).
 
 Usage :
     python extract_dataset.py /path/to/symfony/repo output.csv \
-        [--since "12 months ago"] [--bugfix-threshold 2]
+        [--since "12 months ago"] [--bugfix-threshold 5]
 """
 import argparse
 import csv
@@ -23,7 +23,7 @@ from typing import Dict, List, Optional
 
 # Le parser PHP est partagé avec l'AI Test Engine
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
-from code_parser import _parse_file_content, _read_php_file  # noqa: E402
+from code_parser import _extract_balanced_block, _parse_file_content, _read_php_file  # noqa: E402
 
 
 # Patterns commits "bugfix"
@@ -44,6 +44,11 @@ COMPLEXITY_KEYWORDS = [
     r"&&", r"\|\|", r"\?",
 ]
 COMPLEXITY_RE = re.compile("|".join(COMPLEXITY_KEYWORDS))
+
+# Colonnes du CSV qui ne sont PAS des features : traçabilité (pour retrouver la
+# méthode d'origine et pour grouper le split par fichier) et cible.
+IDENTITY_COLS = ("file", "class", "method", "profile")
+LABEL_COL = "label_risk"
 
 
 def git(args: List[str], cwd: str) -> str:
@@ -86,40 +91,77 @@ def list_controllers(repo_path: str) -> List[str]:
     return sorted(set(controllers))
 
 
-def get_git_metrics(file_path: str, repo_path: str, since: str) -> Dict:
-    """Métriques git pour un fichier dans la fenêtre temporelle."""
-    rel = os.path.relpath(file_path, repo_path)
-    log = git(
-        ["log", f"--since={since}", "--format=%s%x09%ae%x09%ct", "--", rel],
+def get_git_metrics_bulk(repo_path: str, since: str) -> Dict[str, Dict]:
+    """
+    Calcule les métriques git pour TOUS les fichiers du repo en un seul appel
+    `git log`, au lieu d'un appel par fichier (qui scale mal : 150-700+ process
+    git séparés selon le projet, cf. cross_eval.py qui compare sucre/sylius/akeneo).
+
+    Utilise `--name-only` pour associer chaque commit aux fichiers qu'il touche.
+    Format de sortie par commit :
+        <ligne d'en-tête : sujet\tem@il\ttimestamp>
+        <ligne vide>
+        fichier1.php
+        fichier2.php
+        <ligne vide séparant du commit suivant>
+
+    Retourne {chemin_relatif (slashes, posix) : {bugfix_count, total_commits,
+    nb_authors, days_since_change}}.
+    """
+    # Séparateur de commit explicite (\x00) pour ne pas confondre une ligne
+    # vide de fin de commit avec une ligne vide de séparation de fichiers.
+    raw = git(
+        ["log", f"--since={since}", "--name-only",
+         "--format=%x00%s%x09%ae%x09%ct"],
         repo_path,
     )
-    bugfix = total = authors_set_len = 0
-    last_ts = None
-    authors = set()
-    for line in log.splitlines():
-        if not line.strip():
+
+    now = time.time()
+    # file_rel -> {"bugfix": int, "total": int, "authors": set, "last_ts": int|None}
+    acc: Dict[str, Dict] = {}
+
+    commits = raw.split("\x00")
+    for commit_block in commits:
+        if not commit_block.strip():
             continue
-        parts = line.split("\t")
+        lines = commit_block.splitlines()
+        header = lines[0]
+        parts = header.split("\t")
         if len(parts) < 3:
             continue
         msg, email, ts = parts[0], parts[1], parts[2]
-        total += 1
-        authors.add(email)
-        if BUGFIX_RE.search(msg):
-            bugfix += 1
         try:
             ts_int = int(ts)
-            if last_ts is None or ts_int > last_ts:
-                last_ts = ts_int
         except ValueError:
-            pass
-    days_since = (time.time() - last_ts) / 86400 if last_ts else None
-    return {
-        "bugfix_count": bugfix,
-        "total_commits": total,
-        "nb_authors": len(authors),
-        "days_since_change": round(days_since, 1) if days_since is not None else -1.0,
-    }
+            continue
+        is_bugfix = bool(BUGFIX_RE.search(msg))
+
+        # Fichiers touchés par ce commit (lignes suivantes, jusqu'à la fin du bloc)
+        files_touched = [l.strip().replace("\\", "/") for l in lines[1:] if l.strip()]
+        for f in files_touched:
+            entry = acc.setdefault(f, {"bugfix": 0, "total": 0, "authors": set(), "last_ts": None})
+            entry["total"] += 1
+            entry["authors"].add(email)
+            if is_bugfix:
+                entry["bugfix"] += 1
+            if entry["last_ts"] is None or ts_int > entry["last_ts"]:
+                entry["last_ts"] = ts_int
+
+    result: Dict[str, Dict] = {}
+    for f, entry in acc.items():
+        days_since = (now - entry["last_ts"]) / 86400 if entry["last_ts"] else None
+        result[f] = {
+            "bugfix_count": entry["bugfix"],
+            "total_commits": entry["total"],
+            "nb_authors": len(entry["authors"]),
+            "days_since_change": round(days_since, 1) if days_since is not None else -1.0,
+        }
+    return result
+
+
+_EMPTY_GIT_METRICS = {
+    "bugfix_count": 0, "total_commits": 0, "nb_authors": 0, "days_since_change": -1.0,
+}
 
 
 def cyclomatic_complexity(text: Optional[str]) -> int:
@@ -130,7 +172,13 @@ def cyclomatic_complexity(text: Optional[str]) -> int:
 
 
 def extract_method_body(content: str, method_name: str) -> str:
-    """Récupère le corps d'une méthode (best effort)."""
+    """Récupère le corps d'une méthode (best effort).
+
+    Localise le '{' d'ouverture par regex, puis délègue le comptage
+    d'accolades à _extract_balanced_block() (code_parser.py) qui gère
+    strings et commentaires PHP, plutôt qu'un compteur naïf qui coupe
+    au mauvais endroit si '{' ou '}' apparaît dans une string/commentaire.
+    """
     pattern = re.compile(
         r"function\s+" + re.escape(method_name) + r"\s*\([^)]*\)[^{]*\{",
         re.DOTALL,
@@ -138,25 +186,21 @@ def extract_method_body(content: str, method_name: str) -> str:
     m = pattern.search(content)
     if not m:
         return ""
-    # Compteur de braces équilibrées
-    depth = 1
-    start = m.end()
-    i = start
-    while i < len(content) and depth > 0:
-        if content[i] == "{":
-            depth += 1
-        elif content[i] == "}":
-            depth -= 1
-        i += 1
-    return content[start:i - 1]
+    block = _extract_balanced_block(content, m.end() - 1)
+    if block is None:
+        return ""
+    return block[1:-1]
 
 
-def extract_features(file_path: str, repo_path: str, since: str,
+def extract_features(file_path: str, repo_path: str, git_metrics_by_file: Dict[str, Dict],
                      bugfix_threshold: int) -> List[Dict]:
     """
     Une ligne par (controller, méthode).
     Granularité méthode plutôt que route, car beaucoup de projets Symfony
     déclarent leurs routes en YAML hors du code (Sylius, Akeneo).
+
+    git_metrics_by_file cache pré-calculé par get_git_metrics_bulk(), un seul
+    appel git pour tout le repo au lieu d'un appel par fichier ici.
     """
     try:
         content = _read_php_file(file_path)
@@ -167,8 +211,8 @@ def extract_features(file_path: str, repo_path: str, since: str,
     if not parsed.get("class_name"):
         return []
 
-    git_metrics = get_git_metrics(file_path, repo_path, since)
     rel_path = os.path.relpath(file_path, repo_path).replace("\\", "/")
+    git_metrics = git_metrics_by_file.get(rel_path, _EMPTY_GIT_METRICS)
     file_loc = content.count("\n") + 1
 
     rows = []
@@ -235,8 +279,12 @@ def main():
     parser.add_argument("output", help="Fichier CSV de sortie")
     parser.add_argument("--since", default="12 months ago",
                         help='Fenêtre git (ex: "12 months ago")')
-    parser.add_argument("--bugfix-threshold", type=int, default=2,
-                        help="Seuil min de bugfix pour label_risk=1 (défaut: 2)")
+    parser.add_argument("--bugfix-threshold", type=int, default=5,
+                        help="Seuil min de bugfix pour label_risk=1 (défaut: 5). "
+                             "Un seuil trop bas rend le label dégénéré (à 2, SUCRE a "
+                             "82%% de positifs et le modèle ne priorise plus rien) ; "
+                             "trop haut, il ne reste plus assez de fichiers positifs "
+                             "pour entraîner. Voir docs/analyse-resultats-ml.md.")
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
 
@@ -259,13 +307,18 @@ def main():
     if not controllers:
         sys.exit("Aucun controller trouvé.")
 
+    print("Calcul des métriques git (un seul passage sur tout l'historique)...")
+    t_git = time.time()
+    git_metrics_by_file = get_git_metrics_bulk(repo_path, args.since)
+    print(f"  {len(git_metrics_by_file)} fichiers avec historique git ({time.time() - t_git:.1f}s)")
+
     all_rows = []
     t0 = time.time()
     for i, c in enumerate(controllers):
         if i % 25 == 0:
             elapsed = time.time() - t0
             print(f"  [{i:>4}/{len(controllers)}] {elapsed:>5.0f}s — {os.path.basename(c)}")
-        rows = extract_features(c, repo_path, args.since, args.bugfix_threshold)
+        rows = extract_features(c, repo_path, git_metrics_by_file, args.bugfix_threshold)
         all_rows.extend(rows)
 
     if not all_rows:
@@ -282,7 +335,8 @@ def main():
     print(f"\n {len(all_rows)} lignes écrites → {args.output}  ({elapsed:.1f}s)")
     print(f"   label_risk=1 : {n_pos:>4}  ({100 * n_pos / len(all_rows):.1f}%)")
     print(f"   label_risk=0 : {len(all_rows) - n_pos:>4}")
-    print(f"   Features     : {len(fieldnames) - 7} (hors identifiants et label)")
+    n_features = len([c for c in fieldnames if c not in IDENTITY_COLS and c != LABEL_COL])
+    print(f"   Features     : {n_features} (hors identifiants et label)")
 
 
 if __name__ == "__main__":

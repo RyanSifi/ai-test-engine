@@ -25,6 +25,7 @@ Usage :
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -43,27 +44,16 @@ except ImportError:
     HAS_XGB = False
     from sklearn.ensemble import RandomForestClassifier
 
-# ─── Feature sets (identiques à train.py) ────────────────────────────────────
-
-SAFE_FEATURES = [
-    "nb_routes_method", "has_route_attr",
-    "nb_params", "has_form", "is_ajax_only",
-    "nb_voter_checks", "nb_response_types",
-    "has_render", "has_redirect", "has_json", "has_file_download",
-    "nb_method_grants", "nb_class_grants",
-    "nb_constructor_deps", "nb_methods_in_class", "is_invoke",
-    "file_loc", "method_loc", "cyclomatic_complexity",
-    "git_nb_authors", "git_days_since_change",
-]
-
-EDA_DROP = [
-    "is_invoke", "nb_voter_checks", "has_file_download",
-    "has_route_attr", "file_loc", "cyclomatic_complexity",
-]
-SAFE_FEATURES_V2 = [f for f in SAFE_FEATURES if f not in EDA_DROP]
-
-GIT_WINDOW = ["git_nb_authors", "git_days_since_change"]
-SAFE_FEATURES_V3 = [f for f in SAFE_FEATURES_V2 if f not in GIT_WINDOW]
+# ─── Feature sets ────────────────────────────────────────────────────────────
+# Importés de train.py, et non redéfinis ici. Les deux listes étaient auparavant
+# recopiées : elles coïncidaient, mais rien ne le garantissait — modifier un jeu
+# de features dans train.py aurait silencieusement désaligné l'évaluation
+# cross-projet, qui aurait continué de tourner sur l'ancien jeu sans rien signaler.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from train import (  # noqa: E402
+    SAFE_FEATURES, EDA_DROP, SAFE_FEATURES_V2, SAFE_FEATURES_V3,
+    GIT_WINDOW_FEATURES as GIT_WINDOW,
+)
 
 FEATURE_SETS = {"v1": SAFE_FEATURES, "v2": SAFE_FEATURES_V2, "v3": SAFE_FEATURES_V3}
 
@@ -118,8 +108,7 @@ def build_model(y_train: pd.Series):
             random_state=42,
             verbosity=0,
         )
-    # fallback si XGBoost pas dispo
-    from sklearn.ensemble import RandomForestClassifier
+    # fallback si XGBoost pas dispo (RF déjà importé au niveau module dans le bloc except ImportError)
     return RandomForestClassifier(
         n_estimators=400, max_depth=8, class_weight="balanced", random_state=42
     )
@@ -140,8 +129,9 @@ def evaluate(y_true: pd.Series, proba: np.ndarray, threshold: float = 0.5) -> di
     try:
         metrics["roc_auc"] = round(float(roc_auc_score(y_true, proba)), 4)
         metrics["pr_auc"]  = round(float(average_precision_score(y_true, proba)), 4)
-    except Exception:
-        pass
+    except ValueError as e:
+        # Cas attendu : une seule classe dans y_true (ex: dataset Akeneo non annoté)
+        print(f"  [evaluate] ROC-AUC/PR-AUC non calculables : {e}")
     return metrics
 
 
@@ -150,11 +140,11 @@ def _check_labels(name: str, y: pd.Series) -> bool:
     n_pos = int(y.sum())
     n_neg = int((y == 0).sum())
     if n_pos == 0:
-        print(f"  ⚠  [{name}] aucun label positif (label_risk=0 partout) — dataset non annoté.")
-        print(f"     Ce dataset ne peut pas servir de test-set ; ignoré.")
+        print(f"[{name}] aucun label positif (label_risk=0 partout) — dataset non annoté.")
+        print(f"[{name}] Ce dataset ne peut pas servir de test-set ; ignoré.")
         return False
     if n_neg == 0:
-        print(f"  ⚠  [{name}] aucun label négatif — dataset déséquilibré à 100%.")
+        print(f"[{name}] aucun label négatif — dataset déséquilibré à 100%.")
         return False
     return True
 
@@ -170,13 +160,16 @@ def run_cross(train_names: list, test_name: str, features: list) -> dict:
     print(f"{'─'*60}")
 
     # Chargement train
-    X_parts, y_parts = [], []
-    common_features = None
+    # common_features = intersection des features disponibles dans tous les datasets train
+    # (certains projets n'ont pas toutes les colonnes, ex: Sylius sans annotations de route)
+    X_parts, y_parts, avail_sets = [], [], []
     for name in train_names:
         X, y, avail = load(name, features)
         X_parts.append(X)
         y_parts.append(y)
-        common_features = avail if common_features is None else [f for f in common_features if f in avail]
+        avail_sets.append(set(avail))
+    # Ordre préservé via la liste features de référence (set.intersection ne garantit pas l'ordre)
+    common_features = [f for f in features if all(f in s for s in avail_sets)]
 
     X_train = pd.concat([x[common_features] for x in X_parts], ignore_index=True)
     y_train = pd.concat(y_parts, ignore_index=True)
@@ -240,8 +233,8 @@ def main():
     ap.add_argument(
         "--feature-set",
         choices=["v1", "v2", "v3"],
-        default="v2",
-        help="Jeu de features (défaut : v2, nettoyé post-EDA)",
+        default="v3",
+        help="Jeu de features (défaut : v3, aligné sur best_model.pkl déployé — v2 pour comparer avec historique Sylius)",
     )
     ap.add_argument(
         "--out",

@@ -44,14 +44,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
+    balanced_accuracy_score,
     classification_report,
     f1_score,
+    matthews_corrcoef,
     roc_auc_score,
 )
 from sklearn.model_selection import (
     GridSearchCV,
     GroupShuffleSplit,
     StratifiedGroupKFold,
+    cross_val_predict,
     cross_validate,
 )
 from sklearn.pipeline import Pipeline
@@ -62,6 +65,41 @@ try:
     HAS_XGB = True
 except ImportError:
     HAS_XGB = False
+
+# ── Seuils et paramètres d'évaluation ────────────────────────────────────────
+# Écart train/test au-delà duquel on signale du sur-apprentissage. En dessous de
+# 0,05, l'écart relève du bruit d'échantillonnage sur 54 fichiers.
+OVERFIT_GAP_WARNING = 0.05
+# Au-delà, l'écart n'est plus explicable par le bruit : il est signalé "FORT".
+OVERFIT_GAP_SEVERE  = 0.15
+# Seuil à partir duquel on relativise le gap du holdout dans le résumé final
+# (le holdout ne porte que quelques fichiers, son gap est peu fiable).
+OVERFIT_GAP_HOLDOUT_NOTE = 0.10
+
+# Nombre de plis de la validation croisée. 5 est le compromis habituel ; avec
+# seulement 54 fichiers, monter à 10 laisserait des plis de test trop petits.
+CV_N_SPLITS = 5
+
+# Valeur d'imputation. Aucune valeur n'est manquante dans le jeu de référence
+# (vérifié : 0 sur 10 304 cellules) ; c'est un filet pour un dépôt qui
+# produirait des fichiers sans historique git.
+IMPUTATION_VALUE = -1.0
+
+# Seuil de décision. C'est celui de model.predict(), donc celui sous lequel
+# TOUTES les métriques publiées sont calculées — et celui qu'applique le
+# tableau de bord (cf. RISK_PRED_THRESHOLD dans streamlit_app.py).
+DECISION_THRESHOLD = 0.5
+
+# Métrique guidant la RECHERCHE D'HYPERPARAMÈTRES.
+#
+# C'était "f1" jusqu'au 29/07/2026, alors que la SÉLECTION du meilleur modèle se
+# fait sur le MCC — on optimisait donc sur une métrique qu'on déclare par
+# ailleurs trompeuse sur données déséquilibrées. Contradiction qu'un jury
+# connaissant le ML pouvait relever.
+#
+# Désormais le MCC guide l'intégralité du pipeline : réglage, sélection et
+# évaluation. Aucune étape n'utilise plus le F1 comme critère de décision.
+TUNING_SCORING = "matthews_corrcoef" 
 
 # Colonnes du dataset
 ID_COLS = ["file", "class", "method", "profile"]
@@ -76,8 +114,11 @@ LABEL_COL = "label_risk"
 #     - 3 features redondantes (corrélations >0.86, VIF explosés)
 #     - Overfitting accru sur petit dataset (+50% de gap train/test)
 #
-# v2 (SAFE_FEATURES_V2) — Jeu nettoyé post-EDA, 15 features  VALIDÉ
-#   6 features retirées, validé sur 2 projets indépendants :
+# v2 (SAFE_FEATURES_V2) — Jeu nettoyé post-EDA, 15 features  (HISTORIQUE)
+#   6 features retirées. Comparaison v1→v2 conservée ci-dessous à titre de trace ;
+#   ATTENTION : les CV F1 de ce tableau sont à lire contre leur baseline triviale
+#   (SUCRE 82% de positifs → « tout positif » donne déjà F1 = 0.901), ils ne
+#   démontrent donc pas grand-chose seuls. Voir docs/analyse-resultats-ml.md.
 #
 #   ┌─────────────────┬────────────────────────────┬────────────────────────────┐
 #   │                 │ SUCRE (368 lignes, 82% +)  │ Sylius (183 lignes, 26% +) │
@@ -92,7 +133,14 @@ LABEL_COL = "label_risk"
 #   └─────────────────┴────────────────────────────┴────────────────────────────┘
 #
 #   Conclusion : CV F1 quasi identique, overfitting réduit de 36-50% sur Sylius.
-#   v2 généralise mieux → c'est le défaut.
+#
+# v3 (SAFE_FEATURES_V3) — 13 features, structure pure  ← DÉFAUT ACTUEL (20/07/2026)
+#   v2 moins les 2 dernières features git (GIT_WINDOW_FEATURES), calculées sur la
+#   MÊME fenêtre de 12 mois que le label → fuite contemporaine. v3 est le jeu
+#   réellement déployé (ml/models/feature_names.json = ces 13 features), donc le
+#   défaut de --feature-set et de cross_eval.py sont alignés dessus.
+#   Métriques à citer pour v3 : MCC = 0.545 et balanced accuracy = 0.806
+#   (le F1 = 0.851 est SOUS la baseline triviale 0.901 — ne pas le mettre en avant).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -192,8 +240,8 @@ def evaluate(name, model, X_train, y_train, X_test, y_test) -> dict:
 
     # Alerte overfitting
     gap = train_f1 - test_f1
-    if gap > 0.05:
-        severity = "LEGER" if gap < 0.15 else "FORT"
+    if gap > OVERFIT_GAP_WARNING:
+        severity = "LEGER" if gap < OVERFIT_GAP_SEVERE else "FORT"
         print(f"   {severity} OVERFITTING : train_f1 - test_f1 = {gap:.4f}")
     else:
         print(f"Pas d'overfitting detecte (gap = {gap:.4f})")
@@ -207,7 +255,7 @@ def cross_val_report(name, model, X, y, groups, random_state=42):
     méthodes) ne peut être à la fois en apprentissage et en test. Évite la fuite
     de groupe propre à une granularité méthode avec un label défini au niveau
     fichier."""
-    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+    cv = StratifiedGroupKFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=random_state)
     scores = cross_validate(
         model, X, y, groups=groups, cv=cv,
         scoring=["f1", "accuracy", "roc_auc", "balanced_accuracy",
@@ -223,7 +271,7 @@ def cross_val_report(name, model, X, y, groups, random_state=42):
     print(f"      bal_acc  : {scores['test_balanced_accuracy'].mean():.4f}")
     print(f"      mcc      : {scores['test_matthews_corrcoef'].mean():.4f}")
     gap = scores['train_f1'].mean() - scores['test_f1'].mean()
-    if gap > 0.05:
+    if gap > OVERFIT_GAP_WARNING:
         print(f"Overfitting CV gap : {gap:.4f}")
     return {
         "cv_train_f1_mean": float(scores['train_f1'].mean()),
@@ -237,6 +285,74 @@ def cross_val_report(name, model, X, y, groups, random_state=42):
         # AUC cross-validée exposée comme métrique principale : stable, contrairement
         # à l'AUC d'un unique holdout de quelques fichiers.
         "auc": float(scores['test_roc_auc'].mean()),
+    }
+
+
+def _cv_tuning(random_state):
+    """
+    Découpage utilisé pour la RECHERCHE D'HYPERPARAMÈTRES.
+
+    C'était `cv=5` — un entier, donc un StratifiedKFold classique, NON groupé.
+    Pendant le tuning, des méthodes d'un même contrôleur se retrouvaient donc à
+    la fois en apprentissage et en validation : le modèle avait déjà vu la
+    réponse, et les hyperparamètres étaient choisis sur des scores optimistes.
+
+    L'évaluation FINALE publiée, elle, était déjà correctement groupée — les
+    chiffres annoncés n'étaient pas faussés. Seul le CHOIX des hyperparamètres
+    l'était. Avec ce correctif, plus aucune étape ne mélange les fichiers.
+
+    ⚠️ Il faut passer `groups=` à `.fit()` pour que ce découpage serve à
+    quelque chose : sans lui, scikit-learn lève une erreur.
+    """
+    return StratifiedGroupKFold(n_splits=CV_N_SPLITS, shuffle=True,
+                                random_state=random_state)
+
+
+def file_level_report(name, model, X, y, groups, random_state=42):
+    """
+    Ré-évalue les mêmes prédictions croisées, mais AGRÉGÉES PAR FICHIER.
+
+    Pourquoi c'est nécessaire. Le label est défini au niveau du FICHIER, tandis
+    qu'une ligne = une méthode. Les fichiers positifs étant nettement plus gros
+    (13,7 méthodes en moyenne contre 3,9), une métrique calculée par ligne leur
+    donne un poids démesuré : sur SUCRE, un seul contrôleur de 77 méthodes pèse
+    20,9 % du score alors qu'il ne représente qu'1 contrôleur sur 54.
+
+    Or la décision que l'outil fait réellement prendre est « quel CONTRÔLEUR
+    tester en priorité ». Cette fonction mesure donc exactement cette
+    décision-là : chaque fichier compte pour un, quelle que soit sa taille.
+
+    Attendre un score plus bas que la version par ligne — c'est normal, et c'est
+    le chiffre honnête à citer pour l'usage réel.
+    """
+    cv = StratifiedGroupKFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=random_state)
+    pred = cross_val_predict(model, X, y, groups=groups, cv=cv, n_jobs=-1)
+
+    agg = (pd.DataFrame({"file": groups, "y": y, "pred": pred})
+             .groupby("file")
+             .agg(y=("y", "first"), pred=("pred", "mean")))
+    y_file = agg["y"].to_numpy()
+    p_file = (agg["pred"] >= DECISION_THRESHOLD).astype(int).to_numpy()   # vote majoritaire
+
+    mcc = matthews_corrcoef(y_file, p_file)
+    bal = balanced_accuracy_score(y_file, p_file)
+    f1v = f1_score(y_file, p_file, zero_division=0)
+    # Baseline triviale « tout positif », à citer avec le F1
+    baseline_f1 = f1_score(y_file, np.ones_like(y_file), zero_division=0)
+
+    print(f"\n   Agrégé PAR FICHIER ({len(y_file)} contrôleurs, "
+          f"{100 * y_file.mean():.1f}% positifs) :")
+    print(f"      mcc      : {mcc:.4f}")
+    print(f"      bal_acc  : {bal:.4f}")
+    print(f"      f1       : {f1v:.4f}   (baseline triviale : {baseline_f1:.4f})")
+
+    return {
+        "file_mcc": float(mcc),
+        "file_balacc": float(bal),
+        "file_f1": float(f1v),
+        "file_f1_baseline": float(baseline_f1),
+        "n_files": int(len(y_file)),
+        "file_positive_rate": float(y_file.mean()),
     }
 
 
@@ -260,10 +376,11 @@ def main():
     ap.add_argument("--include-total-commits", action="store_true",
                     help="Inclure git_total_commits dans les features "
                          "(leakage partiel, pour comparaison)")
-    ap.add_argument("--feature-set", choices=["v1", "v2", "v3"], default="v2",
-                    help="v1 = toutes les features safe, "
-                         "v2 = nettoyées post-EDA (défaut, validé sur SUCRE + Sylius), "
-                         "v3 = structure pure sans features git de fenêtre (leak-free mais signal réduit)")
+    ap.add_argument("--feature-set", choices=["v1", "v2", "v3"], default="v3",
+                    help="v3 = structure pure sans features git de fenêtre (DÉFAUT, "
+                         "leak-free, aligné sur le modèle déployé ml/models/), "
+                         "v2 = nettoyées post-EDA (historique), "
+                         "v1 = toutes les features safe")
     ap.add_argument("--compare", action="store_true",
                     help="Entraîne avec v1 ET v2 et compare les résultats")
     args = ap.parse_args()
@@ -302,7 +419,7 @@ def main():
     print(f"   Features utilisees : {len(feats)}")
     print(f"   -> {feats}")
 
-    X = df[feats].fillna(-1.0).values
+    X = df[feats].fillna(IMPUTATION_VALUE).values
     y = df[LABEL_COL].astype(int).values
     groups = df["file"].values  # 1 groupe = 1 fichier (et toutes ses méthodes)
 
@@ -338,14 +455,21 @@ def main():
         lr_grid = GridSearchCV(
             lr_pipe,
             {"clf__C": [0.01, 0.1, 1.0, 10.0]},
-            cv=5, scoring="f1", n_jobs=-1,
+            cv=_cv_tuning(args.random_state), scoring=TUNING_SCORING, n_jobs=-1,
         )
-        lr_grid.fit(X_train, y_train)
+        lr_grid.fit(X_train, y_train, groups=groups[train_idx])
         best_lr = lr_grid.best_estimator_
         print(f"   Best params : {lr_grid.best_params_}")
 
     m = evaluate("LogisticRegression", best_lr, X_train, y_train, X_test, y_test)
-    m.update(cross_val_report("LogisticRegression", lr_pipe, X, y, groups, args.random_state))
+    # best_lr (et non lr_pipe) : la sélection du meilleur modèle se fait sur
+    # cv_mcc_mean, il faut donc cross-valider le modèle OPTIMISÉ — comme pour
+    # RandomForest ci-dessous. Cross-valider lr_pipe (non tuné) comparait un RF
+    # optimisé à une LogReg par défaut. Vérifié sur SUCRE : l'écart est de
+    # 0,0003 de MCC et RandomForest reste devant de 0,068, donc les chiffres
+    # déjà publiés restent valides — mais la comparaison est maintenant loyale.
+    m.update(cross_val_report("LogisticRegression", best_lr, X, y, groups, args.random_state))
+    m.update(file_level_report("LogisticRegression", best_lr, X, y, groups, args.random_state))
     all_metrics.append(m)
     confusion_plot("LogReg", best_lr, X_test, y_test,
                    os.path.join(args.output_dir, "confusion_logreg.png"))
@@ -367,14 +491,15 @@ def main():
                 "max_depth": [4, 8, 12],
                 "min_samples_leaf": [3, 5, 10],
             },
-            cv=5, scoring="f1", n_jobs=-1,
+            cv=_cv_tuning(args.random_state), scoring=TUNING_SCORING, n_jobs=-1,
         )
-        rf_grid.fit(X_train, y_train)
+        rf_grid.fit(X_train, y_train, groups=groups[train_idx])
         best_rf = rf_grid.best_estimator_
         print(f"   Best params : {rf_grid.best_params_}")
 
     m = evaluate("RandomForest", best_rf, X_train, y_train, X_test, y_test)
     m.update(cross_val_report("RandomForest", best_rf, X, y, groups, args.random_state))
+    m.update(file_level_report("RandomForest", best_rf, X, y, groups, args.random_state))
     all_metrics.append(m)
     confusion_plot("RandomForest", best_rf, X_test, y_test,
                    os.path.join(args.output_dir, "confusion_rf.png"))
@@ -405,6 +530,7 @@ def main():
         xgb.fit(X_train, y_train)
         m = evaluate("XGBoost", xgb, X_train, y_train, X_test, y_test)
         m.update(cross_val_report("XGBoost", xgb, X, y, groups, args.random_state))
+        m.update(file_level_report("XGBoost", xgb, X, y, groups, args.random_state))
         all_metrics.append(m)
         confusion_plot("XGBoost", xgb, X_test, y_test,
                        os.path.join(args.output_dir, "confusion_xgb.png"))
@@ -415,15 +541,18 @@ def main():
     print("\n" + "=" * 60)
     print("RESUME COMPARATIF")
     print("=" * 60)
-    print(f"{'Modele':<25} {'Train F1':>10} {'Test F1':>10} {'CV F1':>14} {'Gap':>8} {'AUC':>8}")
-    print("-" * 77)
+    print(f"{'Modele':<25} {'CV MCC':>9} {'MCC fichier':>12} {'CV bal-acc':>11} "
+          f"{'CV F1':>14} {'Gap':>8} {'AUC':>8}")
+    print("-" * 92)
     for m in all_metrics:
         cv_f1 = f"{m.get('cv_test_f1_mean', 0):.4f}+/-{m.get('cv_test_f1_std', 0):.3f}"
         auc = f"{m['auc']:.4f}" if m.get('auc') is not None else "  N/A"
-        gap_str = f"{m['overfit_gap']:.4f}"
-        flag = "" if m['overfit_gap'] > 0.05 else ""
-        print(f"{m['model']:<25} {m['train_f1']:>10.4f} {m['test_f1']:>10.4f} "
-              f"{cv_f1:>14} {gap_str:>8}{flag} {auc:>8}")
+        print(f"{m['model']:<25} {m.get('cv_mcc_mean', 0):>9.4f} "
+              f"{m.get('file_mcc', 0):>12.4f} {m.get('cv_balacc_mean', 0):>11.4f} "
+              f"{cv_f1:>14} {m['overfit_gap']:>8.4f} {auc:>8}")
+    print("\n   MCC fichier = même modèle, décision agrégée PAR CONTRÔLEUR.")
+    print("   C'est le chiffre honnête pour l'usage réel (« quel contrôleur tester »),")
+    print("   nécessairement plus bas : par ligne, les gros contrôleurs pèsent davantage.")
 
     # Sélection du meilleur sur le MCC cross-validé : métrique robuste au
     # déséquilibre (le F1 favorise artificiellement le modèle qui colle à la
@@ -435,7 +564,7 @@ def main():
           f"AUC CV={best.get('cv_auc_mean', 0):.4f} | "
           f"bal-acc={best.get('cv_balacc_mean', 0):.4f})")
 
-    if best.get("overfit_gap", 0) > 0.1:
+    if best.get("overfit_gap", 0) > OVERFIT_GAP_HOLDOUT_NOTE:
         print(f"Note : gap train/test (holdout) = {best['overfit_gap']:.4f} "
               "— à relativiser, le holdout ne fait que quelques fichiers ; "
               "le gap CV est la référence.")
@@ -467,9 +596,9 @@ def main():
         print("\n Pour comparer avec git_total_commits, relance avec :")
         print(f"   python {__file__} {args.dataset} --include-total-commits")
         print("   (si le F1 monte beaucoup, c'est que git_total_commits fuit)")
-    if args.feature_set == "v1":
-        print("\n Pour utiliser les features nettoyées post-EDA :")
-        print(f"   python {__file__} {args.dataset} --feature-set v2")
+    if args.feature_set != "v3":
+        print("\n Le jeu déployé est v3 (leak-free, aligné sur ml/models/) :")
+        print(f"   python {__file__} {args.dataset} --feature-set v3")
     print("\n Pour comparer v1 vs v2 côte à côte :")
     print(f"   python {__file__} {args.dataset} --compare")
 
@@ -477,7 +606,7 @@ def main():
 def _quick_train(df, feature_list, test_size, random_state):
     """Entraîne un XGBoost (ou RF) rapidement et retourne les métriques CV."""
     feats = [c for c in feature_list if c in df.columns]
-    X = df[feats].fillna(-1.0).values
+    X = df[feats].fillna(IMPUTATION_VALUE).values
     y = df[LABEL_COL].astype(int).values
     groups = df["file"].values
 
@@ -502,7 +631,7 @@ def _quick_train(df, feature_list, test_size, random_state):
         train_f1 = f1_score(y_train, model.predict(X_train), zero_division=0)
         test_f1 = f1_score(y_test, y_pred, zero_division=0)
 
-        cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+        cv = StratifiedGroupKFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=random_state)
         scores = cross_validate(model, X, y, groups=groups, cv=cv, scoring=["f1"], n_jobs=-1)
         cv_f1 = scores["test_f1"].mean()
         cv_std = scores["test_f1"].std()
@@ -528,7 +657,7 @@ def _quick_train(df, feature_list, test_size, random_state):
     train_f1 = f1_score(y_train, rf.predict(X_train), zero_division=0)
     test_f1 = f1_score(y_test, y_pred, zero_division=0)
 
-    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=random_state)
+    cv = StratifiedGroupKFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=random_state)
     scores = cross_validate(rf, X, y, groups=groups, cv=cv, scoring=["f1"], n_jobs=-1)
     cv_f1 = scores["test_f1"].mean()
     cv_std = scores["test_f1"].std()
@@ -594,8 +723,8 @@ def _run_comparison(df, args):
     dropped = set(feats1) - set(feats2)
     print(f"Features retirées en v2 : {sorted(dropped)}")
     print(f"Features restantes en v2 : {len(feats2)}")
-    print(f"\nPour entraîner avec v2 et sauvegarder le modèle :")
-    print(f"   python {__file__} {args.dataset} --feature-set v2")
+    print(f"\nNB : le jeu déployé est v3 (leak-free). Pour entraîner et sauvegarder :")
+    print(f"   python {__file__} {args.dataset} --feature-set v3")
 
 
 if __name__ == "__main__":
