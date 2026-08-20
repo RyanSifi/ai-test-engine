@@ -27,9 +27,71 @@ MODEL_PATH = ROOT / "models" / "best_model.pkl"
 FEATURES_PATH = ROOT / "models" / "feature_names.json"
 METRICS_PATH = ROOT / "models" / "metrics.json"
 IMPORTANCE_PATH = ROOT / "models" / "feature_importance.csv"
-DATASET_DIR = ROOT.parent / "_dataset"
+# Le dossier des jeux de données n'est pas au même endroit selon le contexte :
+# monté sur /app/_dataset dans le conteneur (cf. docker-compose.yml), et
+# à la racine du dépôt en exécution locale. Sans ce test, la page « Prédiction
+# ML » cherchait /_dataset et affichait « Aucun dataset trouvé » alors que les
+# fichiers étaient bien présents.
+DATASET_DIR = (Path("/app/_dataset") if Path("/app/_dataset").is_dir()
+               else ROOT.parent / "_dataset")
 TEST_ENGINE_URL = os.environ.get("TEST_ENGINE_URL", "http://localhost:8000")
 TEST_ENGINE_API_KEY = os.environ.get("TEST_ENGINE_API_KEY", "")
+
+# Clés session_state — définies ici pour éviter les magic strings répétées dans le code
+_SK_PENDING_JOB      = "pending_job"       # job /generate-test en cours
+_SK_PENDING_UNIT_JOB = "pending_unit_job"  # job /generate-unit-test en cours
+
+# ── Seuils de risque — définis UNE SEULE FOIS ────────────────────────────────
+# RISK_PRED_THRESHOLD est la seule frontière ACTIONNABLE : c'est elle qui décide
+# des classes proposées à la génération de tests.
+#
+# Sa valeur, 0.5, est celle de `model.predict()` — donc celle sous laquelle
+# TOUTES les métriques publiées sont calculées (MCC, balanced accuracy, matrices
+# de confusion). Le dashboard s'y tient pour que les chiffres du mémoire
+# décrivent bien le comportement réel du produit.
+#
+# Un seuil de 0.7 avait été essayé pour coller aux bandes d'affichage. Mesuré en
+# validation croisée groupée, il coûtait cher :
+#     0.5 → MCC 0.717 | rappel 0.804 | 187 méthodes signalées
+#     0.7 → MCC 0.698 | rappel 0.749 | 170 méthodes signalées
+# soit 12 méthodes réellement à risque disparues de la priorisation. Pour un
+# outil dont le rôle est de NE RIEN RATER, échanger 5,5 points de rappel contre
+# 2,4 points de précision va dans le mauvais sens.
+#
+# BAND_* ne sert qu'à l'AFFICHAGE (Faible / Moyen / Élevé) : ces bandes graduent
+# la lecture, elles ne décident de rien.
+RISK_PRED_THRESHOLD = 0.5   # décision : « à tester en priorité »
+BAND_MED            = 0.4   # affichage : seuil Faible → Moyen
+BAND_HIGH           = 0.7   # affichage : seuil Moyen → Élevé
+
+# ── Délais des appels à l'API (secondes) ─────────────────────────────────────
+# Lancement d'un job asynchrone : la réponse est immédiate (un identifiant).
+API_TIMEOUT_QUICK = 30
+# Sondage de statut : lecture d'un dict en mémoire.
+API_TIMEOUT_POLL  = 10
+# Vérification de disponibilité affichée dans la barre latérale — doit rester
+# imperceptible, l'interface l'appelle à chaque rafraîchissement.
+API_TIMEOUT_HEALTH = 2
+# Génération synchrone : le serveur se plafonne lui-même à 840 s
+# (_TOTAL_BUDGET_SEC), on garde une minute de marge au-dessus.
+API_TIMEOUT_GENERATION = 900
+# Extraction d'un dataset : parcourt tout l'historique git du dépôt.
+SUBPROCESS_TIMEOUT_EXTRACT = 600
+
+# ── Confinement de l'extraction de dataset ───────────────────────────────────
+# Le formulaire d'extraction expose deux champs texte libres (chemin du dépôt,
+# nom du CSV) qui aboutissent à un sous-processus. Aucun risque d'injection de
+# commande — subprocess.run reçoit une liste, jamais shell=True — mais sans
+# bornes, on pourrait écrire le CSV n'importe où (`../../etc/x`) ou lancer
+# l'extraction sur un chemin arbitraire du conteneur.
+DATASET_DIR_CONTAINER = "/app/_dataset"
+ALLOWED_REPO_ROOTS = ("/app/_dataset", "/workspace")
+
+# ── Affichage ────────────────────────────────────────────────────────────────
+TOP_CLASSES_CHART = 15   # barres du graphique « classes à risque »
+TABLE_ROWS_MIN    = 5    # bornes du curseur de lignes affichées
+TABLE_ROWS_MAX    = 200
+TABLE_ROWS_DEFAULT = 30
 
 st.set_page_config(
     page_title="AI Test Engine",
@@ -41,13 +103,40 @@ st.set_page_config(
 # ── CSS — système de design CNAM / Bootstrap 5 ───────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,600;0,700;0,800;1,400&display=swap');
+/* ── Aucune police n'est chargée depuis un service externe ───────────────────
+   Un `@import url('https://fonts.googleapis.com/…')` figurait ici. Cet import
+   est exécuté PAR LE NAVIGATEUR de l'utilisateur : chaque ouverture du tableau
+   de bord transmettait donc à Google l'adresse IP du poste, son User-Agent et
+   la page référente.
+
+   Deux raisons de l'avoir retiré :
+   1. Une adresse IP est une donnée personnelle au sens du RGPD. Le tribunal
+      régional de Munich a jugé en janvier 2022 (aff. 3 O 17493/20) que l'appel
+      dynamique à Google Fonts constituait un manquement.
+   2. Cohérence : un outil dont l'argument central est « rien ne sort de
+      l'infrastructure » ne peut pas appeler un CDN américain au chargement.
+
+   La chaîne de repli ci-dessous s'appuie uniquement sur des polices présentes
+   sur le poste. Segoe UI (Windows) et system-ui couvrent tous les cas ;
+   l'apparence est quasi identique. Pour retrouver Source Sans 3 à l'identique,
+   déposer les .woff2 dans ml/assets/ et déclarer une règle @font-face locale. */
 
 /* ── Palette SUCRE ──
    --navy   #1b3e6f  sidebar, en-têtes de colonnes
    --blue   #2d5a9e  bandeaux de page
    --bordo  #a23a3a  item actif, badge dev
-   --cyan   #0084B2  boutons, accents
+   --cyan   #00769F  boutons, liens, accents
+                     (etait #0084B2 : 4,25:1 sur blanc, sous le minimum AA de
+                      4,5:1 — echouait a la fois comme fond de bouton et comme
+                      couleur de lien. #00769F donne 5,13:1.)
+   --bord   #8A9199  bordures des CHAMPS DE SAISIE (3,19:1, critere RGAA 3.3
+                     « composants d'interface » : la bordure identifie la zone
+                     ou saisir. #CED4DA ne donnait que 1,49:1.)
+   --trait  #DEE2E6  bordures DECORATIVES (cartes, panneaux, separateurs).
+                     Volontairement inchangees : 1,4.11 ne s'applique qu'aux
+                     elements necessaires pour IDENTIFIER un composant, ce
+                     qu'un liseré de carte n'est pas. Les assombrir alourdirait
+                     l'interface sans gain d'accessibilite.
    --bg     #EEEEEE  fond                                          */
 
 html, body, [class*="css"], * {
@@ -65,7 +154,7 @@ html, body, [class*="css"], * {
 [data-testid="stAppViewContainer"],
 [data-testid="stMain"], .main { background:#EEEEEE !important; }
 [data-testid="stHeader"] { background:transparent !important; }
-.block-container { padding-top:2rem !important; }
+/* Padding du .block-container : défini plus bas avec --topbar-h (bandeau fixe). */
 
 /* ── SIDEBAR — bleu marine façon SUCRE ── */
 section[data-testid="stSidebar"]{
@@ -130,12 +219,12 @@ h3{ font-size:1.05rem !important; font-weight:600 !important; color:#212529 !imp
 
 /* ── Boutons (cyan institutionnel) ── */
 .stButton > button{
-    background:#0084B2 !important; color:#FFFFFF !important; border:none !important;
+    background:#00769F !important; color:#FFFFFF !important; border:none !important;
     border-radius:0 !important; font-weight:600 !important; padding:8px 20px !important;
     font-size:0.9rem !important; transition:background .15s ease; width:fit-content !important;
 }
 .stButton > button:hover{ background:#006A91 !important; color:#FFFFFF !important; }
-.stButton > button:focus{ box-shadow:0 0 0 3px rgba(0,132,178,.25) !important; outline:none !important; }
+.stButton > button:focus{ box-shadow:0 0 0 3px rgba(0,118,159,.25) !important; outline:none !important; }
 section[data-testid="stSidebar"] .stButton > button{ width:100% !important; }
 
 /* ── Inputs / Textareas / Selects ── */
@@ -143,17 +232,17 @@ section[data-testid="stSidebar"] .stButton > button{ width:100% !important; }
 [data-testid="stTextArea"] textarea,
 div[data-baseweb="input"] input,
 div[data-baseweb="select"] > div{
-    border:1px solid #CED4DA !important; border-radius:0 !important;
+    border:1px solid #8A9199 !important; border-radius:0 !important;
     font-size:0.9rem !important; color:#212529 !important; background:#FFFFFF !important;
 }
 [data-testid="stTextInput"] input:focus,
 [data-testid="stTextArea"] textarea:focus{
-    border-color:#0084B2 !important; box-shadow:0 0 0 2px rgba(0,132,178,.2) !important; outline:none !important;
+    border-color:#00769F !important; box-shadow:0 0 0 2px rgba(0,118,159,.2) !important; outline:none !important;
 }
 
 /* ── Checkbox ── */
 [data-testid="stCheckbox"] label{ color:#212529 !important; }
-[data-testid="stCheckbox"] svg{ color:#0084B2 !important; }
+[data-testid="stCheckbox"] svg{ color:#00769F !important; }
 
 /* ── Onglets ── */
 [data-testid="stTabs"] [data-baseweb="tab-list"]{ border-bottom:2px solid #DEE2E6 !important; background:transparent !important; gap:0 !important; }
@@ -181,12 +270,12 @@ div[data-baseweb="select"] > div{
 [data-testid="stSuccess"]{ background:#D1E7DD !important; color:#0A3622 !important; border-left:4px solid #198754 !important; }
 [data-testid="stError"]{ background:#F8D7DA !important; color:#58151C !important; border-left:4px solid #DC3545 !important; }
 [data-testid="stWarning"]{ background:#FFF3CD !important; color:#664D03 !important; border-left:4px solid #FFC107 !important; }
-[data-testid="stInfo"]{ background:#CFF4FC !important; color:#055160 !important; border-left:4px solid #0084B2 !important; }
+[data-testid="stInfo"]{ background:#CFF4FC !important; color:#055160 !important; border-left:4px solid #00769F !important; }
 [data-testid="stSpinner"] p{ color:#212529 !important; }
 
 hr{ border-color:#DEE2E6 !important; }
 p, div, span, label{ color:#212529; }
-a{ color:#0084B2 !important; }
+a{ color:#00769F !important; }
 a:hover{ color:#006A91 !important; }
 
 /* ── Masquer la barre Streamlit (Deploy / menu) + décoration ── */
@@ -195,14 +284,23 @@ a:hover{ color:#006A91 !important; }
 }
 header[data-testid="stHeader"]{ height:0 !important; min-height:0 !important; background:transparent !important; }
 
-/* ── Sidebar : suppression du vide marine en haut ── */
+/* ── Sidebar : décalée sous le bandeau fixe (la nav commence sous la barre
+      blanche pleine largeur, comme SUCRE). Le fond marine remplit toute la
+      hauteur ; le bandeau blanc (z-index élevé) recouvre juste sa partie haute. ── */
 [data-testid="stSidebarHeader"]{ display:none !important; }
 [data-testid="stSidebarCollapseButton"]{ display:none !important; }
-[data-testid="stSidebarUserContent"]{ padding-top:0 !important; }
+[data-testid="stSidebarUserContent"]{ padding-top:calc(var(--topbar-h) + 10px) !important; }
 section[data-testid="stSidebar"] > div:first-child{ padding-top:0 !important; }
 
-/* ── Contenu principal remonté sous la top-bar ── */
-.block-container{ padding-top:1.1rem !important; }
+/* ── Bandeau fixe pleine largeur + décalage du contenu ──
+      --topbar-h : hauteur du bandeau blanc, qui couvre TOUTE la largeur en haut
+      (par-dessus la sidebar, façon SUCRE). Le contenu principal et la sidebar
+      sont décalés vers le bas de cette hauteur. ── */
+:root{ --pad-x:2.6rem; --topbar-h:86px; }
+.block-container{
+    padding:calc(var(--topbar-h) + 18px) var(--pad-x) 2.4rem var(--pad-x) !important;
+    max-width:100% !important;
+}
 
 </style>
 """, unsafe_allow_html=True)
@@ -245,11 +343,85 @@ def predict(df: pd.DataFrame, model, features) -> pd.DataFrame:
         df["risk_score"] = model.predict_proba(X)[:, 1]
     else:
         df["risk_score"] = model.predict(X)
-    df["risk_pred"] = (df["risk_score"] >= 0.5).astype(int)
+    df["risk_pred"] = (df["risk_score"] >= RISK_PRED_THRESHOLD).astype(int)
     df["risk_label"] = df["risk_score"].apply(
-        lambda v: "Élevé" if v >= 0.7 else ("Moyen" if v >= 0.4 else "Faible")
+        lambda v: "Élevé" if v >= BAND_HIGH else ("Moyen" if v >= BAND_MED else "Faible")
     )
     return df
+
+
+def _call_generate(endpoint: str, payload: dict, async_mode: bool, session_key: str) -> None:
+    """
+    Lance un appel POST vers `endpoint` (generate-test ou generate-unit-test) et
+    gère l'affichage du résultat — factorise les deux blocs identiques de la page
+    "Génération de tests" pour éviter la duplication de ~140 lignes.
+
+    - async_mode=True  : retourne immédiatement un job_id, stocké dans session_state[session_key]
+    - async_mode=False : attend la réponse (timeout 900s) et affiche le résultat directement
+    """
+    url = f"{TEST_ENGINE_URL}/{endpoint}"
+    if async_mode:
+        try:
+            r = requests.post(url, json=payload, headers=api_headers(), timeout=API_TIMEOUT_QUICK)
+            if r.status_code == 200:
+                body = r.json()
+                st.session_state[session_key] = body.get("job_id")
+                st.info(f"Job lancé : `{body.get('job_id')}` — résultat dans quelques instants…")
+            else:
+                st.error(f"HTTP {r.status_code} — {r.text[:200]}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Erreur réseau : {e}")
+    else:
+        with st.spinner("Génération en cours (mode sync)…"):
+            try:
+                r = requests.post(url, json=payload, headers=api_headers(), timeout=API_TIMEOUT_GENERATION)
+                if r.status_code == 200:
+                    body = r.json()
+                    st.success(f"Test généré : `{body.get('file', '')}`")
+                    st.info(body.get("note", ""))
+                    with st.expander("Réponse complète"):
+                        st.json(body)
+                else:
+                    st.error(f"HTTP {r.status_code}")
+                    st.code(r.text)
+            except requests.exceptions.RequestException as e:
+                st.error(f"Erreur réseau : {e}")
+
+
+def _poll_job(session_key: str, poll_btn_key: str, cancel_btn_key: str) -> None:
+    """
+    Affiche le widget de polling pour un job async stocké dans session_state[session_key].
+    Factorise les deux blocs de polling (fonctionnel / unitaire) identiques à ~40 lignes.
+    """
+    if not st.session_state.get(session_key):
+        return
+    job_id = st.session_state[session_key]
+    st.markdown(f"**Job en cours : `{job_id}`**")
+    col_poll, col_cancel = st.columns([1, 1])
+    if col_poll.button("Actualiser le statut", key=poll_btn_key):
+        try:
+            r = requests.get(f"{TEST_ENGINE_URL}/job/{job_id}/status",
+                             headers=api_headers(), timeout=API_TIMEOUT_POLL)
+            if r.status_code == 200:
+                job = r.json()
+                status = job.get("status", "?")
+                if status == "done":
+                    st.success("Terminé !")
+                    st.info(job.get("result", {}).get("note", ""))
+                    st.json(job.get("result", {}))
+                    st.session_state.pop(session_key, None)
+                elif status == "error":
+                    st.error(f"Erreur : {job.get('error', '?')}")
+                    st.session_state.pop(session_key, None)
+                else:
+                    st.info(f"Statut : **{status}** — réactualise dans quelques secondes.")
+            else:
+                st.warning(f"HTTP {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            st.error(f"Erreur polling : {e}")
+    if col_cancel.button("Annuler le suivi", key=cancel_btn_key):
+        st.session_state.pop(session_key, None)
+        st.rerun()
 
 
 def api_headers() -> dict:
@@ -261,9 +433,10 @@ def api_headers() -> dict:
 
 def check_api() -> bool:
     try:
-        r = requests.get(f"{TEST_ENGINE_URL}/health", timeout=2)
+        r = requests.get(f"{TEST_ENGINE_URL}/health", timeout=API_TIMEOUT_HEALTH)
         return r.status_code == 200
-    except Exception:
+    except requests.exceptions.RequestException:
+        # Timeout, connexion refusée, DNS — tous les cas réseau attendus
         return False
 
 
@@ -279,23 +452,30 @@ def _logo_data_uri():
 
 
 def top_bar():
-    """En-tête institutionnel façon SUCRE : logo + séparateur + pastille dev."""
+    """Bandeau institutionnel façon SUCRE : FIXE, pleine largeur du viewport,
+    au-dessus de la sidebar (la barre blanche traverse tout le haut ; la sidebar
+    et le contenu sont décalés dessous via --topbar-h). Logo + séparateur +
+    pastille dev + titre bleu."""
     uri = _logo_data_uri()
     if uri:
-        logo = f'<img src="{uri}" alt="logo" style="height:58px;width:auto;display:block;">'
+        logo = f'<img src="{uri}" alt="logo" style="height:56px;width:auto;display:block;">'
     else:
-        logo = ('<div style="height:58px;width:150px;border:1px dashed #ADB5BD;'
+        logo = ('<div style="height:56px;width:150px;border:1px dashed #ADB5BD;'
                 'display:flex;align-items:center;justify-content:center;color:#ADB5BD;'
                 'font-size:0.78rem;font-weight:600;letter-spacing:.04em;">LOGO</div>')
+    # position:fixed + z-index très élevé → la barre recouvre le haut de la sidebar
+    # marine et occupe toute la largeur de l'écran, comme dans SUCRE.
     st.markdown(f"""
-<div style="background:#FFFFFF;padding:16px 28px;margin:-0.4rem -1rem 16px -1rem;
-            display:flex;align-items:center;gap:22px;
-            border-bottom:1px solid #E3E7EB;box-shadow:0 1px 3px rgba(0,0,0,.04);">
+<div style="position:fixed;top:0;left:0;right:0;height:var(--topbar-h);z-index:2147483000;
+            background:#FFFFFF;padding:0 26px;box-sizing:border-box;
+            display:flex;align-items:center;gap:20px;
+            border-bottom:1px solid #E3E7EB;box-shadow:0 1px 4px rgba(0,0,0,.06);">
   {logo}
   <div style="width:1px;height:46px;background:#C9D3DE;"></div>
   <span style="background:#a23a3a;color:#fff;font-size:0.8rem;font-weight:700;
                padding:3px 13px;border-radius:14px;">dev</span>
-  <span style="font-size:1.45rem;font-weight:800;color:#0084B2;letter-spacing:.01em;">AI&nbsp;TEST&nbsp;ENGINE</span>
+  <span style="font-size:1.4rem;font-weight:700;color:#00769F;letter-spacing:.01em;
+               white-space:nowrap;">AI&nbsp;TEST&nbsp;ENGINE</span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -331,7 +511,7 @@ def flow(steps):
         parts.append(
             f'<div style="display:flex;gap:13px;align-items:stretch;">'
             f'<div style="display:flex;flex-direction:column;align-items:center;flex-shrink:0;">'
-            f'<div style="width:25px;height:25px;border-radius:50%;background:#0084B2;color:#fff;'
+            f'<div style="width:25px;height:25px;border-radius:50%;background:#00769F;color:#fff;'
             f'display:flex;align-items:center;justify-content:center;font-size:0.78rem;'
             f'font-weight:700;">{i + 1}</div>{rail}</div>'
             f'<div style="padding:{pad};">'
@@ -362,31 +542,27 @@ def svc_badge(name):
 
 # Sidebar
 with st.sidebar:
-    st.markdown("""
-<div style="margin:-1rem -1rem 4px -1rem;padding:18px 20px 14px;
-            background:rgba(0,0,0,.18);border-bottom:1px solid rgba(255,255,255,.15);">
-  <div style="color:#fff;font-size:1.05rem;font-weight:800;letter-spacing:.02em;">AI&nbsp;TEST&nbsp;ENGINE</div>
-  <div style="color:rgba(255,255,255,.7);font-size:0.78rem;margin-top:2px;">Dashboard &amp; g&eacute;n&eacute;ration de tests</div>
-</div>
-""", unsafe_allow_html=True)
-
-    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
-
-    api_ok = check_api()
-    dot = '<span class="dot-green"></span>' if api_ok else '<span class="dot-red"></span>'
-    status_txt = "API connectée" if api_ok else "API hors ligne"
-    st.markdown(
-        f'<div style="padding:8px 18px;border-bottom:1px solid rgba(255,255,255,.15);margin-bottom:6px;">'
-        f'{dot}<small style="color:#dfe7f2;">{status_txt}</small></div>',
-        unsafe_allow_html=True
-    )
+    # Sidebar façon SUCRE : la navigation démarre directement en haut, sans bloc
+    # de titre (le branding « AI TEST ENGINE » vit dans le bandeau du haut, pas ici).
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
     page = st.radio(
         "Navigation",
         ["Accueil", "Prédiction ML", "Génération de tests", "Performance"],
         label_visibility="collapsed",
     )
-    st.markdown("<hr style='margin:12px 0;border-color:#DEE2E6'>", unsafe_allow_html=True)
+
+    # Pied de sidebar : statut API + méta (regroupés en bas, hors de la nav).
+    # check_api() reste ici car api_ok est réutilisé par les pages plus bas.
+    api_ok = check_api()
+    dot = '<span class="dot-green"></span>' if api_ok else '<span class="dot-red"></span>'
+    status_txt = "API connectée" if api_ok else "API hors ligne"
+    st.markdown("<hr style='margin:14px 0 10px;border-color:rgba(255,255,255,.18)'>", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="padding:2px 18px 6px;">{dot}'
+        f'<small style="color:#dfe7f2;">{status_txt}</small></div>',
+        unsafe_allow_html=True
+    )
     st.caption(f"Modèle : `best_model.pkl`")
     st.caption(f"API : `{TEST_ENGINE_URL}`")
 
@@ -400,10 +576,12 @@ if page == "Accueil":
     page_header("AI Test Engine", "Prédicteur de risque de régression · Génération de tests Symfony")
 
     metrics = load_metrics()
-    best_auc = metrics["best"].get("cv_auc_mean", metrics["best"].get("auc", 0)) if metrics else 0
-    best_bal = metrics["best"].get("cv_balacc_mean", 0) if metrics else 0
-    best_mcc = metrics["best"].get("cv_mcc_mean", 0) if metrics else 0
-    best_name = metrics["best"].get("model", "—") if metrics else "—"
+    best = metrics.get("best", {}) if metrics else {}
+    # cv_auc_mean = clé actuelle ; "auc" = clé legacy des anciens metrics.json
+    best_auc  = best.get("cv_auc_mean", best.get("auc", 0))
+    best_bal  = best.get("cv_balacc_mean", 0)
+    best_mcc  = best.get("cv_mcc_mean", 0)
+    best_name = best.get("model", "—")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("AUC-ROC (CV)", f"{best_auc:.3f}" if best_auc else "—")
@@ -418,8 +596,8 @@ if page == "Accueil":
         st.markdown('<div class="section-header">Pipeline ML</div>', unsafe_allow_html=True)
         flow([
             ("Git history + code source Symfony",),
-            ("extract_dataset.py", "Features PHP + git, nettoyées post-EDA"),
-            ("dataset_sucre.csv",),
+            ("extract_dataset.py", "Features structurelles, seuil bugfix 5"),
+            ("dataset_sucre_t5.csv",),
             ("train.py — GridSearchCV", "LogReg / RF / XGBoost"),
             ("best_model.pkl", "Sélection par CV groupée par fichier"),
             ("Ce dashboard", "Prédiction + export"),
@@ -431,7 +609,7 @@ if page == "Accueil":
             ("Dépôt Symfony indexé",),
             ("Chunking PHP (AST)",),
             ("Embeddings MiniLM-L12", "paraphrase-multilingual"),
-            ("pgvector HNSW (cosine)", "3× plus rapide que seqscan"),
+            ("pgvector HNSW (cosine)", "×2,24 vs parcours séquentiel"),
             ("FastAPI /generate-test", "LLM → WebTestCase PHP + validation php -l + retry"),
         ])
 
@@ -445,10 +623,14 @@ if page == "Accueil":
                           "sentence-transformers", "Docker Compose"])
     with col_c:
         tech_card("Déploiement", [
-            "3 services Docker",
-            f"{svc_badge('vector-db')}&nbsp;:5432",
-            f"{svc_badge('brain-api')}&nbsp;:8000",
+            "5 services Docker",
             f"{svc_badge('streamlit-ui')}&nbsp;:8501",
+            f"{svc_badge('brain-api')}&nbsp;:8000",
+            # vector-db et ollama ne publient aucun port : ils ne sont joignables
+            # que depuis le réseau interne. C'est un choix de sécurité, pas un oubli.
+            f"{svc_badge('vector-db')}&nbsp;<i>interne</i>",
+            f"{svc_badge('ollama')}&nbsp;<i>interne</i>",
+            f"{svc_badge('ollama-pull')}&nbsp;<i>éphémère</i>",
         ])
 
 
@@ -457,7 +639,8 @@ elif page == "Prédiction ML":
     page_header("Prédiction ML", "Chargez un dataset CSV produit par <code>extract_dataset.py</code>")
 
     if model is None:
-        st.error("Aucun modèle entraîné. Lance d'abord `python ml/train.py _dataset/dataset_sucre.csv`")
+        st.error("Aucun modèle entraîné. Lance d'abord "
+                 "`python ml/train.py _dataset/dataset_sucre_t5.csv --feature-set v3`")
         st.stop()
 
     # ── Extraction dataset ────────────────────────────────────────────────────
@@ -477,24 +660,62 @@ elif page == "Prédiction ML":
         )
         ex_col3, ex_col4, ex_col5 = st.columns(3)
         ex_since = ex_col3.text_input("--since", value="36 months ago")
-        ex_threshold = ex_col4.number_input("--bugfix-threshold", min_value=1, value=1)
-        ex_feature_set = ex_col5.selectbox("--feature-set (train)", ["v2", "v1", "v3"])
+        # Défauts alignés sur ceux du code (extract_dataset.py / train.py) après
+        # recalibrage : un seuil de 1 ou 2 rend le label dégénéré (82 % de positifs
+        # sur SUCRE → le modèle ne priorise plus rien) et v2 n'est plus le jeu de
+        # features déployé. Proposer ici les anciennes valeurs revenait à faire
+        # refabriquer par l'interface le dataset que le recalibrage a écarté.
+        ex_threshold = ex_col4.number_input(
+            "--bugfix-threshold", min_value=1, value=5,
+            help="5 = valeur calibrée. En dessous, le label devient dégénéré "
+                 "(à 2, SUCRE a 82 % de positifs et la priorisation perd son sens).",
+        )
+        ex_feature_set = ex_col5.selectbox(
+            "--feature-set (train)", ["v3", "v2", "v1"],
+            help="v3 = 13 features structurelles sans fuite git — le jeu réellement déployé.",
+        )
 
-        output_path = f"/app/_dataset/{ex_output}"
+        # ── Assainissement des entrées avant de les passer à un sous-processus ──
+        # Il n'y a PAS de risque d'injection de commande : subprocess.run reçoit une
+        # LISTE d'arguments et jamais shell=True, donc les métacaractères du shell
+        # (;, |, &&, $()) sont transmis littéralement, pas interprétés.
+        #
+        # Le risque réel est ailleurs : ces deux champs sont libres, et sans contrôle
+        # ils permettent d'écrire un CSV n'importe où dans le conteneur (`../../etc/x`)
+        # ou de lancer l'extraction sur un dépôt arbitraire. On borne donc les deux.
+        nom_sortie = os.path.basename(ex_output.strip()) or "dataset.csv"
+        if not nom_sortie.endswith(".csv"):
+            nom_sortie += ".csv"
+        output_path = os.path.join(DATASET_DIR_CONTAINER, nom_sortie)
+
+        chemin_depot = os.path.normpath(ex_repo.strip())
+        depot_autorise = any(
+            chemin_depot == racine or chemin_depot.startswith(racine + os.sep)
+            for racine in ALLOWED_REPO_ROOTS
+        )
+
         cmd = (
-            f"python /app/extract_dataset.py {ex_repo} {output_path}"
+            f"python /app/extract_dataset.py {chemin_depot} {output_path}"
             f' --since "{ex_since}" --bugfix-threshold {ex_threshold}'
         )
         st.code(cmd, language="bash")
 
-        if st.button("Lancer l'extraction", key="btn_extract"):
+        if nom_sortie != ex_output.strip():
+            st.caption(f"Nom de sortie normalisé : `{nom_sortie}`")
+        if not depot_autorise:
+            st.warning(
+                f"Chemin hors des racines autorisées ({', '.join(ALLOWED_REPO_ROOTS)}). "
+                "L'extraction ne sera pas lancée."
+            )
+
+        if st.button("Lancer l'extraction", key="btn_extract", disabled=not depot_autorise):
             with st.spinner("Extraction en cours — peut prendre plusieurs minutes…"):
                 try:
                     result = subprocess.run(
-                        ["python", "/app/extract_dataset.py", ex_repo, output_path,
+                        ["python", "/app/extract_dataset.py", chemin_depot, output_path,
                          "--since", ex_since,
                          "--bugfix-threshold", str(ex_threshold)],
-                        capture_output=True, text=True, timeout=600,
+                        capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_EXTRACT,
                         env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                     )
                     if result.returncode == 0:
@@ -526,7 +747,14 @@ elif page == "Prédiction ML":
             if not datasets:
                 st.warning("Aucun dataset trouvé dans `_dataset/`")
                 st.stop()
-            default_idx = next((i for i, n in enumerate(datasets) if n == "dataset_sucre.csv"), 0)
+            # Présélection : le dataset qui a SERVI À ENTRAÎNER le modèle chargé
+            # (seuil 5, 59,5 % de positifs). L'ancien `dataset_sucre.csv` est au
+            # seuil 2 (82 % de positifs) — le proposer par défaut faisait comparer
+            # les prédictions à un label que le modèle n'a jamais appris.
+            default_idx = next(
+                (i for i, n in enumerate(datasets) if n == "dataset_sucre_t5.csv"),
+                next((i for i, n in enumerate(datasets) if n == "dataset_sucre.csv"), 0),
+            )
             selected = st.selectbox("Fichier", datasets, index=default_idx)
             df_raw = pd.read_csv(DATASET_DIR / selected)
         else:
@@ -542,23 +770,34 @@ elif page == "Prédiction ML":
         st.stop()
 
     df = predict(df_raw.copy(), model, FEATURES)
-    nb_high = int((df["risk_score"] >= 0.7).sum())
-    nb_med  = int(((df["risk_score"] >= 0.4) & (df["risk_score"] < 0.7)).sum())
-    nb_low  = int((df["risk_score"] < 0.4).sum())
+    nb_high = int((df["risk_score"] >= BAND_HIGH).sum())
+    nb_med  = int(((df["risk_score"] >= BAND_MED) & (df["risk_score"] < BAND_HIGH)).sum())
+    nb_low  = int((df["risk_score"] < BAND_MED).sum())
+    nb_prio = int(df["risk_pred"].sum())
 
     st.markdown('<div class="section-header">Vue d\'ensemble</div>', unsafe_allow_html=True)
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Méthodes analysées", len(df))
-    c2.metric("Risque élevé (>=70%)", nb_high)
-    c3.metric("Risque moyen (40-70%)", nb_med)
-    c4.metric("Risque faible (<40%)", nb_low)
+    c1.metric("Méthodes analysées", len(df),
+              help="Une ligne par méthode. Le score de risque, lui, est au niveau du contrôleur (voir note ci-dessous).")
+    c2.metric(f"Risque élevé (>={BAND_HIGH:.0%})", nb_high)
+    c3.metric(f"Risque moyen ({BAND_MED:.0%}-{BAND_HIGH:.0%})", nb_med)
+    c4.metric(f"À tester (>={RISK_PRED_THRESHOLD:.0%})", nb_prio,
+              help="Seuil de décision du modèle — c'est cette liste qui alimente "
+                   "la génération de tests, et celle sous laquelle les métriques "
+                   "publiées (MCC, balanced accuracy) sont calculées.")
     c5.metric("Classes uniques", df["class"].nunique() if "class" in df.columns else "—")
 
-    st.caption(
-        "Le modèle est réglé pour ne rien rater (class_weight='balanced') : il sur-signale "
-        "volontairement, donc le nombre de « risque élevé » est plus grand que la prévalence "
-        "réelle des régressions. Pour prioriser, il faut se fier au classement par score ci-dessous "
-        "plutôt qu'au simple total des « risque élevé »."
+    st.info(
+        "**À lire avant d'interpréter les scores.**\n\n"
+        "**Granularité réelle = le contrôleur, pas la méthode.** Le score repose surtout sur "
+        "des caractéristiques de *classe* (nombre de dépendances injectées, de méthodes, de "
+        "rôles), identiques pour toutes les méthodes d'un même contrôleur, et le label "
+        "d'apprentissage est calculé par *fichier*. Deux méthodes du même contrôleur ont donc "
+        "un score quasi identique : lis ce tableau comme un **classement de contrôleurs à "
+        "tester en priorité**, pas comme une hiérarchie fine entre méthodes.\n\n"
+        "**Sur-signalement volontaire** (`class_weight='balanced'`) : le modèle préfère "
+        "sur-alerter que rater une régression, donc le total « risque élevé » dépasse la "
+        "prévalence réelle. Fie-toi au **classement par score**, pas au total brut."
     )
 
     col_g1, col_g2 = st.columns(2)
@@ -567,7 +806,7 @@ elif page == "Prédiction ML":
         if HAS_PLOTLY:
             fig = px.histogram(
                 df, x="risk_score", nbins=30,
-                color_discrete_sequence=["#0084B2"],
+                color_discrete_sequence=["#00769F"],
                 labels={"risk_score": "Score de risque"},
             )
             fig.add_vline(x=0.5, line_dash="dash", line_color="#dc2626",
@@ -580,8 +819,8 @@ elif page == "Prédiction ML":
             st.plotly_chart(fig, use_container_width=True)
         else:
             fig, ax = plt.subplots(figsize=(7, 3))
-            ax.hist(df["risk_score"], bins=30, color="#0084B2", edgecolor="#1b3e6f")
-            ax.axvline(0.5, color="red", linestyle="--")
+            ax.hist(df["risk_score"], bins=30, color="#00769F", edgecolor="#1b3e6f")
+            ax.axvline(RISK_PRED_THRESHOLD, color="red", linestyle="--")
             st.pyplot(fig)
 
     with col_g2:
@@ -589,11 +828,11 @@ elif page == "Prédiction ML":
         if "class" in df.columns and HAS_PLOTLY:
             top_classes = (
                 df.groupby("class")["risk_score"].mean()
-                .nlargest(15).reset_index()
+                .nlargest(TOP_CLASSES_CHART).reset_index()
                 .sort_values("risk_score")
             )
             top_classes["color"] = top_classes["risk_score"].apply(
-                lambda v: "#dc2626" if v >= 0.7 else ("#d97706" if v >= 0.4 else "#16a34a")
+                lambda v: "#dc2626" if v >= BAND_HIGH else ("#d97706" if v >= BAND_MED else "#16a34a")
             )
             fig2 = go.Figure(go.Bar(
                 x=top_classes["risk_score"],
@@ -613,8 +852,9 @@ elif page == "Prédiction ML":
         else:
             st.info("Colonne `class` absente — graphique non disponible.")
 
-    st.markdown('<div class="section-header">Méthodes prioritaires à tester</div>', unsafe_allow_html=True)
-    top_n = st.slider("Nombre de méthodes à afficher", 5, min(200, len(df)), 30)
+    st.markdown('<div class="section-header">Contrôleurs prioritaires à tester (détail par méthode)</div>', unsafe_allow_html=True)
+    top_n = st.slider("Nombre de lignes à afficher", TABLE_ROWS_MIN,
+                      min(TABLE_ROWS_MAX, len(df)), TABLE_ROWS_DEFAULT)
     display_cols = [c for c in ["class", "method", "risk_label", "risk_score",
                                 "cyclomatic_complexity", "nb_params",
                                 "git_bugfix_count", "file"]
@@ -641,7 +881,8 @@ elif page == "Prédiction ML":
             if "class" in df.columns else []
         )
         if not risky:
-            st.info("Aucune classe avec risque >= 50%.")
+            st.info(f"Aucune classe au-dessus du seuil de décision "
+                    f"({RISK_PRED_THRESHOLD:.0%}).")
         else:
             project_id = st.text_input("project_id", value="sucre", key="qgen_pid")
             n_cls = st.slider("Nb classes", 1, len(risky), min(3, len(risky)), key="qgen_n")
@@ -661,7 +902,7 @@ elif page == "Prédiction ML":
                                       "class_name": cls,
                                       "test_name": f"{cls}Test",
                                       "deterministic": True},
-                                headers=api_headers(), timeout=900,
+                                headers=api_headers(), timeout=API_TIMEOUT_GENERATION,
                             )
                             body = r.json() if "application/json" in r.headers.get("content-type", "") else {}
                             results.append({"class": cls, "status": r.status_code,
@@ -729,7 +970,7 @@ elif page == "Génération de tests":
                             r = requests.post(
                                 f"{TEST_ENGINE_URL}/index-project",
                                 json={"project_path": repo_path, "project_id": proj_id},
-                                headers=api_headers(), timeout=300,
+                                headers=api_headers(), timeout=800,
                             )
                             if r.status_code == 200:
                                 st.success("Indexation réussie !")
@@ -746,14 +987,47 @@ elif page == "Génération de tests":
         with st.form("form_func"):
             col_f1, col_f2 = st.columns(2)
             f_project = col_f1.text_input("project_id", value="sucre")
-            f_class   = col_f2.text_input("Classe cible (optionnel)",
-                                          placeholder="ProductController")
-            f_desc = st.text_area("Description du scénario",
-                                  placeholder="Tester GET /products avec et sans auth",
-                                  height=80)
-            f_test_name = st.text_input("Nom du test (optionnel)",
-                                        placeholder="ProductControllerTest")
-            f_det   = st.checkbox("Mode déterministe (sans LLM)", value=True)
+            f_class   = col_f2.text_input(
+                "Classe cible (recommandé)",
+                placeholder="CreanceController",
+                help="Nom exact de la classe de contrôleur à tester. C'est CE champ qui "
+                     "cible le bon contrôleur (recherche directe en base) — renseigne-le "
+                     "pour un résultat fiable.",
+            )
+            f_desc = st.text_area(
+                "Description du scénario",
+                placeholder="Ex : Tester la consultation et l'édition des créances, "
+                            "l'export CSV, et les contrôles d'accès par rôle.",
+                height=90,
+                help="Décris EN FRANÇAIS, avec le vocabulaire métier, ce que fait le "
+                     "contrôleur. Ce texte sert à retrouver le bon code (recherche "
+                     "sémantique) — ce n'est PAS un squelette de test. Les routes, rôles "
+                     "et types de réponse sont déjà connus par le moteur.",
+            )
+            with st.expander("Comment écrire une bonne description ?"):
+                st.markdown(
+                    "La description **aide le moteur à retrouver le bon code** — elle ne "
+                    "dicte pas la structure du test (le squelette est généré automatiquement).\n\n"
+                    "**À faire**\n"
+                    "- Une phrase courte en **français métier** : "
+                    "*« consultation et édition des créances, export CSV, accès par rôle »*.\n"
+                    "- **Renseigner la Classe cible** (ex. `CreanceController`) : c'est elle "
+                    "qui garantit le bon contrôleur.\n\n"
+                    "**À éviter**\n"
+                    "- Coller du **code PHP / un squelette** de test → ça dégrade la recherche.\n"
+                    "- Rester **vague** (*« teste le contrôleur »*) → contexte mal ciblé."
+                )
+            f_test_name = st.text_input(
+                "Nom du test (optionnel)",
+                placeholder="CreanceControllerTest",
+                help="Nom de la classe de test générée. Par défaut : <Classe>Test.",
+            )
+            f_det   = st.checkbox(
+                "Mode déterministe (sans LLM)", value=True,
+                help="Coché : génération directe depuis le code indexé (rapide, zéro "
+                     "hallucination, couverture riche). Décoché : génération par le LLM, "
+                     "route par route.",
+            )
             f_async = st.checkbox("Mode asynchrone (non-bloquant)", value=True,
                                   help="Retourne un job_id immédiatement et poll le résultat.")
             if st.form_submit_button("Générer le test fonctionnel"):
@@ -769,65 +1043,10 @@ elif page == "Génération de tests":
                     if f_test_name:
                         payload["test_name"] = f_test_name
 
-                    if f_async:
-                        # Mode async : on lance et on stocke le job_id en session
-                        try:
-                            r = requests.post(f"{TEST_ENGINE_URL}/generate-test",
-                                              json=payload, headers=api_headers(), timeout=30)
-                            if r.status_code == 200:
-                                body = r.json()
-                                st.session_state["pending_job"] = body.get("job_id")
-                                st.info(f"Job lancé : `{body.get('job_id')}` — résultat dans quelques instants…")
-                            else:
-                                st.error(f"HTTP {r.status_code} — {r.text[:200]}")
-                        except Exception as e:
-                            st.error(f"Erreur : {e}")
-                    else:
-                        with st.spinner("Génération en cours (mode sync)…"):
-                            try:
-                                r = requests.post(f"{TEST_ENGINE_URL}/generate-test",
-                                                  json=payload, headers=api_headers(), timeout=900)
-                                if r.status_code == 200:
-                                    body = r.json()
-                                    st.success(f"Test généré : `{body.get('file', '')}`")
-                                    st.info(body.get("note", ""))
-                                    with st.expander("Réponse complète"):
-                                        st.json(body)
-                                else:
-                                    st.error(f"HTTP {r.status_code}")
-                                    st.code(r.text)
-                            except Exception as e:
-                                st.error(f"Erreur : {e}")
+                    _call_generate("generate-test", payload, f_async, _SK_PENDING_JOB)
 
-        # ── Polling du job en cours ────────────────────────────────────────────
-        if st.session_state.get("pending_job"):
-            job_id = st.session_state["pending_job"]
-            st.markdown(f"**Job en cours : `{job_id}`**")
-            col_poll, col_cancel = st.columns([1, 1])
-            if col_poll.button("Actualiser le statut", key="btn_poll"):
-                try:
-                    r = requests.get(f"{TEST_ENGINE_URL}/job/{job_id}/status",
-                                     headers=api_headers(), timeout=10)
-                    if r.status_code == 200:
-                        job = r.json()
-                        status = job.get("status", "?")
-                        if status == "done":
-                            st.success("Terminé !")
-                            st.info(job.get("result", {}).get("note", ""))
-                            st.json(job.get("result", {}))
-                            st.session_state.pop("pending_job", None)
-                        elif status == "error":
-                            st.error(f"Erreur : {job.get('error', '?')}")
-                            st.session_state.pop("pending_job", None)
-                        else:
-                            st.info(f"Statut : **{status}** — réactualise dans quelques secondes.")
-                    else:
-                        st.warning(f"HTTP {r.status_code}")
-                except Exception as e:
-                    st.error(f"Erreur polling : {e}")
-            if col_cancel.button("Annuler le suivi", key="btn_cancel"):
-                st.session_state.pop("pending_job", None)
-                st.rerun()
+        # Polling du job en cours
+        _poll_job(_SK_PENDING_JOB, "btn_poll", "btn_cancel")
 
     with tab_unit:
         st.markdown('<div class="section-header">Générer un test unitaire PHPUnit</div>',
@@ -854,64 +1073,10 @@ elif page == "Génération de tests":
                     if u_class:
                         payload["class_name"] = u_class
 
-                    if u_async:
-                        try:
-                            r = requests.post(f"{TEST_ENGINE_URL}/generate-unit-test",
-                                              json=payload, headers=api_headers(), timeout=30)
-                            if r.status_code == 200:
-                                body = r.json()
-                                st.session_state["pending_unit_job"] = body.get("job_id")
-                                st.info(f"Job lancé : `{body.get('job_id')}` — résultat dans quelques instants…")
-                            else:
-                                st.error(f"HTTP {r.status_code} — {r.text[:200]}")
-                        except Exception as e:
-                            st.error(f"Erreur : {e}")
-                    else:
-                        with st.spinner("Génération en cours (mode sync)…"):
-                            try:
-                                r = requests.post(f"{TEST_ENGINE_URL}/generate-unit-test",
-                                                  json=payload, headers=api_headers(), timeout=900)
-                                if r.status_code == 200:
-                                    body = r.json()
-                                    st.success(f"Test généré : `{body.get('file', '')}`")
-                                    st.info(body.get("note", ""))
-                                    with st.expander("Réponse complète"):
-                                        st.json(body)
-                                else:
-                                    st.error(f"HTTP {r.status_code}")
-                                    st.code(r.text)
-                            except Exception as e:
-                                st.error(f"Erreur : {e}")
+                    _call_generate("generate-unit-test", payload, u_async, _SK_PENDING_UNIT_JOB)
 
         # ── Polling du job unitaire en cours ──────────────────────────────────
-        if st.session_state.get("pending_unit_job"):
-            unit_job_id = st.session_state["pending_unit_job"]
-            st.markdown(f"**Job en cours : `{unit_job_id}`**")
-            col_upoll, col_ucancel = st.columns([1, 1])
-            if col_upoll.button("Actualiser le statut", key="btn_upoll"):
-                try:
-                    r = requests.get(f"{TEST_ENGINE_URL}/job/{unit_job_id}/status",
-                                     headers=api_headers(), timeout=10)
-                    if r.status_code == 200:
-                        job = r.json()
-                        status = job.get("status", "?")
-                        if status == "done":
-                            st.success("Terminé !")
-                            st.info(job.get("result", {}).get("note", ""))
-                            st.json(job.get("result", {}))
-                            st.session_state.pop("pending_unit_job", None)
-                        elif status == "error":
-                            st.error(f"Erreur : {job.get('error', '?')}")
-                            st.session_state.pop("pending_unit_job", None)
-                        else:
-                            st.info(f"Statut : **{status}** — réactualise dans quelques secondes.")
-                    else:
-                        st.warning(f"HTTP {r.status_code}")
-                except Exception as e:
-                    st.error(f"Erreur polling : {e}")
-            if col_ucancel.button("Annuler le suivi", key="btn_ucancel"):
-                st.session_state.pop("pending_unit_job", None)
-                st.rerun()
+        _poll_job(_SK_PENDING_UNIT_JOB, "btn_upoll", "btn_ucancel")
 
 
 # PAGE : PERFORMANCE
@@ -953,7 +1118,7 @@ elif page == "Performance":
         if HAS_PLOTLY:
             fig_bar = go.Figure()
             for col, color, label in [
-                ("cv_auc_mean",    "#0084B2", "AUC (CV)"),
+                ("cv_auc_mean",    "#00769F", "AUC (CV)"),
                 ("cv_balacc_mean", "#2d5a9e", "Balanced acc (CV)"),
                 ("cv_mcc_mean",    "#1b3e6f", "MCC (CV)"),
             ]:
@@ -990,7 +1155,7 @@ elif page == "Performance":
             fig_imp = go.Figure(go.Bar(
                 x=top15["importance"], y=top15["feature"],
                 orientation="h",
-                marker_color="#0084B2",
+                marker_color="#00769F",
                 text=top15["importance"].apply(lambda v: f"{v:.4f}"),
                 textposition="outside",
             ))
@@ -1005,7 +1170,7 @@ elif page == "Performance":
             st.plotly_chart(fig_imp, use_container_width=True)
         else:
             fig, ax = plt.subplots(figsize=(8, 5))
-            ax.barh(top15["feature"], top15["importance"], color="#0084B2")
+            ax.barh(top15["feature"], top15["importance"], color="#00769F")
             ax.set_xlabel("Importance")
             st.pyplot(fig)
 
