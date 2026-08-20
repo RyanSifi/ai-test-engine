@@ -46,3 +46,4 @@ ml/*.joblib
 
 # Dependance PHP installee au build (voir app/Dockerfile : composer install)
 app/php_ast/vendor/
+docs/
