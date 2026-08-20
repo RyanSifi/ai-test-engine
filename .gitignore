@@ -14,8 +14,13 @@ venv/
 env
 
 # Données runtime (volumes Docker)
-data/pg_data/
-data/ollama_data/
+# Tout le dossier, et non les seuls sous-dossiers connus : une sauvegarde
+# renommée (ex. data/pg_data.corrompu-AAAAMMJJ, 78 Mo) échappait aux règles
+# `data/pg_data/` et partait dans l'historique au premier `git add .`.
+data/
+
+# Mémoire / documents bureautiques — hors périmètre du dépôt de code
+*.docx
 
 # IDE
 .idea/
@@ -35,3 +40,9 @@ _dataset/
 ml/notebooks/.ipynb_checkpoints/
 ml/*.pkl
 ml/*.joblib
+
+# Support de presentation - hors perimetre du depot de code
+*.pptx
+
+# Dependance PHP installee au build (voir app/Dockerfile : composer install)
+app/php_ast/vendor/

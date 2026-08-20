@@ -12,7 +12,13 @@ services:
       POSTGRES_USER:     admin
       POSTGRES_PASSWORD: secret_ai_password
     volumes:
-      - ./data/pg_data:/var/lib/postgresql/data:Z
+      # Volume Docker NOMMÉ (et non un bind mount vers le système de fichiers hôte).
+      # Un bind mount Windows (./data/pg_data) provoquait une corruption du cluster
+      # PostgreSQL ("could not read block ... read only 0 of 8192 bytes") : la
+      # sémantique de verrouillage/fsync de Docker Desktop sur Windows ne correspond
+      # pas à ce que PostgreSQL attend. Un volume nommé est géré par Docker et évite
+      # ce problème. Inspection : docker volume inspect ai-test-engine_pg_data
+      - pg_data:/var/lib/postgresql/data
     networks:
       - internal_ai
     healthcheck:
@@ -23,7 +29,65 @@ services:
       start_period: 20s
 
   # ──────────────────────────────────────────────────────────────────────────
-  # 2. API FASTAPI (moteur de test IA)
+  # 2. OLLAMA — modèle de langage local
+  # ──────────────────────────────────────────────────────────────────────────
+  # Ollama tournait auparavant SUR L'HÔTE, joint via host.docker.internal. Ce
+  # montage était la première cause d'échec d'installation : Ollama n'écoute que
+  # sur 127.0.0.1 par défaut, donc les conteneurs ne l'atteignaient pas. Symptôme
+  # trompeur — tout démarrait normalement, et seule la génération partait en
+  # timeout, sans message explicite. Il fallait penser à `setx OLLAMA_HOST 0.0.0.0`
+  # PUIS redémarrer réellement Ollama.
+  #
+  # Conteneurisé, le problème disparaît : le service est joignable par son nom sur
+  # le réseau interne, sans configuration côté poste.
+  #
+  # Pour revenir à un Ollama installé sur l'hôte (ex. pour exploiter un GPU) :
+  #   1. commenter ce service et ollama-pull ;
+  #   2. retirer ollama de `depends_on` de brain-api ;
+  #   3. remettre OLLAMA_URL: http://host.docker.internal:11434/api/generate
+  #      (l'entrée extra_hosts est conservée pour ce cas).
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai_ollama
+    restart: unless-stopped
+    volumes:
+      # Volume NOMMÉ : sans lui, les ~2 Go du modèle seraient re-téléchargés à
+      # chaque recréation du conteneur.
+      - ollama_models:/root/.ollama
+    networks:
+      - internal_ai
+    # Port volontairement NON publié : le service n'est joignable que depuis le
+    # réseau Docker interne. Évite aussi tout conflit avec un Ollama déjà
+    # installé sur le poste, qui occupe le même port 11434.
+    # Décommenter pour interroger l'API depuis l'hôte (debug) :
+    # ports:
+    #   - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout:  5s
+      retries:  10
+      start_period: 30s
+
+  # Service ÉPHÉMÈRE : télécharge le modèle puis s'arrête. Son état « Exited (0) »
+  # dans `docker compose ps` est donc normal, pas une erreur.
+  # Sans lui, il faudrait penser à lancer le pull à la main au premier démarrage.
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: ai_ollama_pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Cible le conteneur ollama, pas un daemon local (le CLI en démarrerait un).
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "qwen2.5-coder:3b"]
+    networks:
+      - internal_ai
+    restart: "no"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # 3. API FASTAPI (moteur de test IA)
   # ──────────────────────────────────────────────────────────────────────────
   brain-api:
     build: ./app
@@ -32,21 +96,26 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Monte le projet Symfony PARENT en lecture-écriture dans /workspace
-      # Structure attendue :
-      #   mon-projet-symfony/          <- dossier parent
-      #     ai-test-engine/            <- ce dossier (docker-compose.yml)
-      #     src/                       <- code Symfony
-      #     templates/                 <- templates Twig
-      #     tests/                     <- tests générés ici
-      - ..:/workspace:rw
+      # Monte le projet Symfony à analyser en lecture-écriture dans /workspace.
+      # Le chemin vient de PROJECT_PATH (.env), relatif à ce fichier.
+      #
+      #   Défaut « .. » — le moteur est un sous-dossier du projet analysé :
+      #     mon-projet-symfony/
+      #       ai-test-engine/          <- ce dossier (docker-compose.yml)
+      #       src/  templates/  tests/ <- code Symfony, tests générés ici
+      #
+      #   Projets côte à côte — poser PROJECT_PATH=../mon-projet :
+      #     un-dossier/
+      #       ai-test-engine/
+      #       mon-projet/              <- src/ templates/ tests/
+      - ${PROJECT_PATH:-..}:/workspace:rw
       # Hot-reload : modifier app/*.py sans reconstruire l'image
       - ./app:/app
-      - "../:/mnt/sucre:ro"
       - "./ml:/app/ml:ro"
     environment:
       DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
-      OLLAMA_URL:               http://host.docker.internal:11434/api/generate
+      # Nom du service Docker, pas host.docker.internal : Ollama est conteneurisé.
+      OLLAMA_URL:               http://ollama:11434/api/generate
       DEFAULT_EMBEDDING_MODEL:  paraphrase-multilingual-MiniLM-L12-v2
       DEFAULT_LLM_MODEL:        qwen2.5-coder:3b
       # --- Réglages d'inférence LLM (modifiables sans rebuild) ---
@@ -67,8 +136,10 @@ services:
     depends_on:
       vector-db:
         condition: service_healthy   # Attend que PostgreSQL accepte les connexions
-    # Sur Docker Engine Linux (sans Docker Desktop), host.docker.internal n'est pas
-    # résolu par défaut. Cette ligne le mappe vers la passerelle hôte.
+      ollama:
+        condition: service_healthy   # Attend qu'Ollama réponde
+    # Conservé pour le mode « Ollama sur l'hôte » décrit plus haut : sur Docker
+    # Engine Linux, host.docker.internal n'est pas résolu sans cette entrée.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -81,7 +152,7 @@ services:
       start_period: 60s   # Laisser le temps au modele d'embedding de se charger
 
   # ──────────────────────────────────────────────────────────────────────────
-  # 3. INTERFACE STREAMLIT
+  # 4. INTERFACE STREAMLIT
   # ──────────────────────────────────────────────────────────────────────────
   streamlit-ui:
     build: ./ml
@@ -90,12 +161,14 @@ services:
     ports:
       - "8501:8501"
     volumes:
-      - ..:/workspace:rw
+      - ${PROJECT_PATH:-..}:/workspace:rw
       - ./ml:/app
       - "./_dataset:/app/_dataset:ro"
     environment:
       DATABASE_URL:             postgresql://admin:secret_ai_password@vector-db:5432/knowledge_base
-      OLLAMA_URL:               http://host.docker.internal:11434/api/generate
+      # Streamlit n'appelle pas Ollama directement (tout passe par brain-api),
+      # mais la variable est alignée pour éviter toute confusion en debug.
+      OLLAMA_URL:               http://ollama:11434/api/generate
       TEST_ENGINE_URL:          http://brain-api:8000
     command: >
       streamlit run streamlit_app.py
@@ -119,3 +192,16 @@ networks:
     # Pour integrer dans un reseau Docker externe existant :
     # external: true
     # name: mon-reseau-existant
+
+# ──────────────────────────────────────────────────────────────────────────
+# VOLUMES
+# ──────────────────────────────────────────────────────────────────────────
+volumes:
+  # Modèles Ollama (~2 Go). Volume nommé pour éviter un re-téléchargement
+  # à chaque recréation du conteneur.
+  ollama_models:
+
+  # Données PostgreSQL/pgvector. Volume géré par Docker : ne pas remplacer par
+  # un bind mount vers un dossier Windows (corruption du cluster, cf. commentaire
+  # dans le service vector-db et docs/benchmark-bdd.md §5).
+  pg_data:
