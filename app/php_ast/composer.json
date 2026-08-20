@@ -1,0 +1,12 @@
+{
+    "name": "ai-test-engine/php-ast-bridge",
+    "description": "Pont AST minimal pour code_parser.py — parse un fichier PHP via nikic/php-parser et émet du JSON sur stdout.",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "nikic/php-parser": "^5.0"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

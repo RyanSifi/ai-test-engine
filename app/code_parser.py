@@ -1,7 +1,13 @@
+import json
 import os
 import re
+import subprocess
 from typing import List, Dict, Optional
 import logging
+
+from chunk_format import (
+    MAX_TWIG_ITEMS, MAX_TWIG_SECONDARY,
+)
 
 
 def _read_php_file(file_path: str) -> str:
@@ -24,10 +30,6 @@ def _read_php_file(file_path: str) -> str:
 # CONSTANTES REGEX
 # ---------------------------------------------------------------------------
 
-CLASS_NAME_REGEX = re.compile(
-    r"(?:class|interface|trait)\s+([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)",
-    re.IGNORECASE
-)
 ROUTE_REGEX = re.compile(r"Route\(\s*(?:path\s*:\s*)?['\"]([^'\"]+)['\"]")
 PHPDOC_ROUTE_REGEX = re.compile(r"@Route\(\s*['\"]([^'\"]+)['\"]")
 PHPDOC_SUMMARY_REGEX = re.compile(
@@ -50,30 +52,17 @@ TWIG_INCLUDE_REGEX    = re.compile(r"include\(['\"]([^'\"]+)['\"]")
 TWIG_TABLE_ID_REGEX   = re.compile(r'<table\b[^>]*\bid=[\'"]([^\'"]+)[\'"]', re.IGNORECASE)  # IDs de tables (DataTable)
 RENDER_REGEX          = re.compile(r"\->render\(['\"]([^'\"]+)['\"]")
 
-# Nouvelles regex
-
-# Extraction des méthodes HTTP depuis les attributs #[Route] et @Route
-# Supporte les deux syntaxes :
-#   - PHP 8 nommé   : methods: ['GET', 'POST']
-#   - PHP 8 posit.  : methods: ["GET"]
-#   - PHPDoc legacy  : methods={"GET","POST"}
-ROUTE_METHODS_REGEX = re.compile(
-    r"methods\s*[:=]\s*[\[{]\s*(['\"][A-Z]+['\"](?:\s*,\s*['\"][A-Z]+['\"])*)\s*[\]}]",
-    re.IGNORECASE,
-)
-
-# Extraction de #[IsGranted('ROLE_XXX')] — attribut PHP 8
-# Capture le rôle entre quotes et l'éventuel message
-ISGRANTED_ATTR_REGEX = re.compile(
-    r"#\[IsGranted\(\s*['\"]([^'\"]+)['\"]"
-    r"(?:\s*,\s*message\s*:\s*['\"]([^'\"]+)['\"])?"
-    r"\s*\)\]",
-    re.IGNORECASE,
-)
-
-# Extraction de @IsGranted / @Security dans PHPDoc (Symfony < 6)
+# Extraction de @IsGranted / @Security dans PHPDoc (Symfony < 6, annotation en
+# commentaire — pas de la vraie syntaxe PHP, l'AST ne peut pas aider ici).
 ISGRANTED_PHPDOC_REGEX = re.compile(
     r"@IsGranted\(\s*['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+
+# Extraction du methods={...} d'une annotation PHPDoc @Route (Symfony < 6).
+# Idem : annotation en commentaire, pas de la vraie syntaxe PHP.
+PHPDOC_ROUTE_METHODS_REGEX = re.compile(
+    r"methods\s*[:=]\s*[\[{]\s*(['\"][A-Z]+['\"](?:\s*,\s*['\"][A-Z]+['\"])*)\s*[\]}]",
     re.IGNORECASE,
 )
 
@@ -99,38 +88,31 @@ BINARY_RESPONSE_RE   = re.compile(r"BinaryFileResponse|StreamedResponse", re.IGN
 FILE_DOWNLOAD_RE     = re.compile(r"Content-Disposition.*attachment|file_get_contents|readfile\(", re.IGNORECASE)
 EXPORT_RESPONSE_RE   = re.compile(r"ExportResponse|CsvResponse|XlsResponse", re.IGNORECASE)
 
-# Extraction de toutes les routes d'un bloc d'attributs (support multi-route)
-ALL_ROUTES_REGEX = re.compile(
-    r"#\[Route\(\s*(?:path\s*:\s*)?['\"]([^'\"]+)['\"]"
-    r"((?:\s*,\s*[a-zA-Z_]+\s*:\s*(?:['\"][^'\"]*['\"]|[\[{][^\]]*[\]}]|\w+))*)"
-    r"\s*\)\]",
-    re.DOTALL,
-)
-
-# Extraction du name: d'une route
-ROUTE_NAME_REGEX = re.compile(
-    r"name\s*[:=]\s*['\"]([^'\"]+)['\"]",
-    re.IGNORECASE,
-)
-
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 
-def _extract_balanced_block(content: str, open_pos: int) -> Optional[str]:
+def _extract_balanced(content: str, open_pos: int, opening: str, closing: str) -> Optional[str]:
     """
-    Extrait un bloc délimité par des accolades équilibrées { ... }
-    à partir de la position open_pos (qui doit pointer sur '{').
-    Retourne le bloc complet (accolades comprises) ou None.
+    Extrait un bloc délimité par un jeu de délimiteurs équilibrés (ex: "{" / "}",
+    ou "([{" / ")]}" pour une liste d'arguments PHP pouvant mélanger parenthèses,
+    crochets et accolades). La profondeur est comptée globalement (peu importe le
+    type exact de délimiteur ouvrant/fermant) : du PHP valide ne mélange jamais
+    ces délimiteurs de façon incohérente, donc ça suffit à gérer un nombre
+    arbitraire de niveaux d'imbrication — contrairement à une regex à profondeur
+    fixe (type [^\\]]*), qui casse silencieusement dès 2 niveaux.
+
+    open_pos doit pointer sur un caractère de `opening`.
+    Retourne le bloc complet (délimiteurs compris) ou None.
 
     Gère correctement :
     - les séquences d'échappement PHP (\\' et \\")
     - les commentaires ligne (//, #) et bloc (/* ... */)
     - les chaînes de caractères (' et ")
-    pour ne pas compter d'accolades à l'intérieur de ces éléments.
+    pour ne pas compter de délimiteurs à l'intérieur de ces éléments.
     """
-    if open_pos >= len(content) or content[open_pos] != '{':
+    if open_pos >= len(content) or content[open_pos] not in opening:
         return None
     length = len(content)
     depth = 0
@@ -153,7 +135,7 @@ def _extract_balanced_block(content: str, open_pos: int) -> Optional[str]:
             i += 1
             continue
 
-        # Hors chaîne : détecter commentaires, chaînes, accolades
+        # Hors chaîne : détecter commentaires, chaînes, délimiteurs
         next_ch = content[i + 1] if i + 1 < length else ''
 
         # Commentaire ligne : // ou #
@@ -179,16 +161,25 @@ def _extract_balanced_block(content: str, open_pos: int) -> Optional[str]:
             i += 1
             continue
 
-        # Accolades
-        if ch == '{':
+        # Délimiteurs
+        if ch in opening:
             depth += 1
-        elif ch == '}':
+        elif ch in closing:
             depth -= 1
             if depth == 0:
                 return content[open_pos:i + 1]
 
         i += 1
-    return None  # Accolade fermante manquante
+    return None  # Délimiteur fermant manquant
+
+
+def _extract_balanced_block(content: str, open_pos: int) -> Optional[str]:
+    """
+    Extrait un bloc délimité par des accolades équilibrées { ... }
+    à partir de la position open_pos (qui doit pointer sur '{').
+    Cas particulier de _extract_balanced() pour les corps de code PHP.
+    """
+    return _extract_balanced(content, open_pos, "{", "}")
 
 
 def _find_class_block(content: str, class_name: str) -> Optional[str]:
@@ -232,72 +223,6 @@ def _find_method_block(class_content: str, method_name: str) -> Optional[str]:
     if block is None:
         return None
     return class_content[m.start():m.start() + (m.end() - m.start()) + len(block) - 1]
-
-
-# Nouveaux helpers
-
-def _extract_http_methods(attr_text: str) -> List[str]:
-    """
-    Extrait les verbes HTTP depuis un bloc d'attributs #[Route] ou @Route.
-    Ex : methods: ['GET', 'POST']  →  ['GET', 'POST']
-    Ex : methods={"POST"}          →  ['POST']
-    Retourne ['GET'] par défaut si rien n'est spécifié.
-    """
-    m = ROUTE_METHODS_REGEX.search(attr_text)
-    if not m:
-        return []  # vide = non spécifié (le caller décidera du défaut)
-    raw = m.group(1)
-    return [v.strip().strip("'\"").upper() for v in raw.split(",")]
-
-
-def _extract_isgranted_from_attrs(attr_text: str) -> List[Dict]:
-    """
-    Extrait tous les #[IsGranted] ou @IsGranted d'un bloc d'attributs.
-    Retourne une liste de {"role": "ROLE_XXX", "message": "..."|None}.
-    """
-    results = []
-    for m in ISGRANTED_ATTR_REGEX.finditer(attr_text):
-        results.append({
-            "role":    m.group(1),
-            "message": m.group(2) if m.group(2) else None,
-        })
-    for m in ISGRANTED_PHPDOC_REGEX.finditer(attr_text):
-        results.append({
-            "role":    m.group(1),
-            "message": None,
-        })
-    return results
-
-
-def _extract_all_routes(attr_text: str, class_route_prefix: str) -> List[Dict]:
-    """
-    Extrait TOUTES les routes d'un bloc d'attributs (supporte les multi-Route).
-    Retourne une liste de {"path": "/foo", "name": "foo_index", "http_methods": ["GET"]}.
-    """
-    routes = []
-    for m in ALL_ROUTES_REGEX.finditer(attr_text):
-        raw_path = m.group(1)
-        full_match = m.group(0)
-
-        # Concaténation avec le préfixe de classe
-        if class_route_prefix:
-            path = (class_route_prefix.rstrip('/') + '/' + raw_path.lstrip('/')).replace('//', '/')
-        else:
-            path = raw_path
-
-        # Nom de la route
-        name_m = ROUTE_NAME_REGEX.search(full_match)
-        name = name_m.group(1) if name_m else None
-
-        # Verbes HTTP
-        http_methods = _extract_http_methods(full_match)
-
-        routes.append({
-            "path":         path,
-            "name":         name,
-            "http_methods": http_methods,
-        })
-    return routes
 
 
 def _analyze_method_body(method_body: str) -> Dict:
@@ -400,8 +325,18 @@ def _analyze_method_body(method_body: str) -> Dict:
     return result
 
 
+# Proportion de routes d'un même type au-delà de laquelle le contrôleur est dit
+# « dominé » par ce type. À 0,7, un contrôleur dont 7 routes sur 10 renvoient du
+# JSON est classé "api" ; en dessous, il devient "mixed" et reçoit les règles de
+# génération des deux familles.
+#
+# ⚠️ Ce seuil pilote la stratégie de test appliquée en aval (règles de prompt,
+# assertions attendues) — le baisser rend les profils plus tranchés mais fait
+# passer des contrôleurs hybrides pour des API pures, et inversement.
+PROFILE_DOMINANCE_RATIO = 0.7
+
+
 def _classify_controller(
-    class_name: str,
     methods: List[Dict],
     class_grants: List[Dict],
 ) -> str:
@@ -412,13 +347,17 @@ def _classify_controller(
     Profils possibles :
     - "web_crud"     : routes HTTP classiques avec render/redirect (ex: CreanceController)
     - "api"          : retourne majoritairement du JSON (JsonResponse, ->json())
-    - "internal"     : pas de route HTTP, appelé en interne (ex: EtatImportController)
+    - "internal"     : pas de route HTTP, appelé en interne (ex: EtatImportController,
+                       ou contrôleur batch/command — non distingué d'"internal" pour
+                       l'instant, faute de signal fiable pour les séparer)
     - "mixed"        : mélange de web et d'API (routes render + routes json)
-    - "batch"        : contrôleur de traitement batch/command sans route
-    """
-    routed   = [m for m in methods if m.get("routes")]
-    unrouted = [m for m in methods if not m.get("routes") and m["name"] != "__construct"]
 
+    NOTE : un profil "batch" distinct était documenté mais n'est jamais produit ici —
+    retiré pour ne pas laisser un consommateur (ex: _RE_PROFILE côté main.py) chercher
+    une valeur qui n'existe pas. Si un signal de détection batch/command apparaît un jour
+    (ex: présence dans Command/, ou suffixe de nom de classe), l'ajouter ici explicitement.
+    """
+    routed = [m for m in methods if m.get("routes")]
     if not routed:
         return "internal"
 
@@ -432,15 +371,12 @@ def _classify_controller(
             json_count += 1
 
     total_routed = len(routed)
-    if total_routed == 0:
-        return "internal"
-
     json_ratio   = json_count / total_routed
     render_ratio = render_count / total_routed
 
-    if json_ratio > 0.7:
+    if json_ratio > PROFILE_DOMINANCE_RATIO:
         return "api"
-    if render_ratio > 0.7:
+    if render_ratio > PROFILE_DOMINANCE_RATIO:
         return "web_crud"
     if json_count > 0 and render_count > 0:
         return "mixed"
@@ -449,46 +385,119 @@ def _classify_controller(
 
 
 # ---------------------------------------------------------------------------
-# PARSING D'UN FICHIER PHP
+# PARSING D'UN FICHIER PHP — via AST (nikic/php-parser, pont app/php_ast/)
 # ---------------------------------------------------------------------------
+#
+# Historique : ce module parsait auparavant les routes, attributs #[Route]/
+# #[IsGranted] et paramètres par regex + comptage d'accolades maison. Un bug
+# concret (01/07/2026) a montré la limite de cette approche : une regex à
+# profondeur fixe échouait silencieusement sur un #[Route(...)] contenant un
+# tableau imbriqué à 2 niveaux dans `requirements`. Plutôt que de durcir
+# indéfiniment les regex au fur et à mesure des cas piège découverts, la
+# structure (classes, méthodes, attributs, params) est maintenant extraite
+# par un vrai parseur PHP (nikic/php-parser) via un petit script pont
+# (php_ast/parse.php), appelé en sous-processus. Le contenu du corps des
+# méthodes reste ensuite analysé par regex simples (_analyze_method_body) :
+# ce sont des recherches de sous-chaînes/patterns, pas du comptage de
+# profondeur, donc pas la même classe de risque.
 
-_PARAM_MODIFIERS = {"private", "public", "protected", "readonly", "abstract", "final", "static"}
-
-# Regex hissées en module pour éviter la recompilation à chaque méthode
-_PHPDOC_BACK_RE     = re.compile(r"/\*\*.*?\*/", re.DOTALL)
-_ATTR_BACK_RE       = re.compile(r"(?:#\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+", re.DOTALL)
-_CLOSE_BRACE_RE     = re.compile(r'(?:\n[ \t]*\}|\}[ \t]*\n)')
-_OPEN_CLASS_BRACE_RE = re.compile(r'\n[ \t]*\{')
-_LOOKBACK_CHARS     = 600
+_PHP_AST_SCRIPT = os.path.join(os.path.dirname(__file__), "php_ast", "parse.php")
 
 
-def _extract_params(params_str: str) -> List[Dict]:
+def _parse_via_ast(content: str) -> Optional[Dict]:
     """
-    Transforme la chaîne des paramètres d'une méthode en liste structurée.
-    Gère les valeurs par défaut (= 1, = null, = []), les modifiers de promotion
-    de propriétés (private readonly), les types nullables (?Foo) et namespacés.
+    Appelle le pont PHP (php_ast/parse.php) pour parser `content` via un vrai
+    AST. Retourne le dict JSON qu'il produit (class_name, class_attributes,
+    class_docblock, methods), ou None si le parsing échoue (PHP absent,
+    syntaxe PHP invalide, sortie JSON invalide) — dans ce cas l'appelant
+    traite le fichier comme non parsable, même comportement qu'avant quand
+    aucune classe n'était trouvée.
     """
-    params = []
-    for raw in params_str.split(','):
-        raw = raw.strip()
-        if not raw:
-            continue
-        if '=' in raw:
-            raw = raw.split('=', 1)[0].strip()
-        parts = raw.split()
-        if not parts:
-            continue
-        name_idx = next(
-            (i for i in range(len(parts) - 1, -1, -1) if parts[i].startswith('$')),
-            -1,
+    try:
+        proc = subprocess.Popen(
+            ["php", _PHP_AST_SCRIPT],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
         )
-        if name_idx == -1:
-            continue
-        param_name = parts[name_idx].lstrip('$')
-        type_tokens = [p for p in parts[:name_idx] if p not in _PARAM_MODIFIERS]
-        param_type = type_tokens[-1].lstrip('?\\') if type_tokens else None
-        params.append({"type": param_type, "name": param_name})
-    return params
+        stdout, stderr = proc.communicate(input=content)
+    except FileNotFoundError:
+        logging.warning("PHP non disponible — parsing AST impossible.")
+        return None
+    if proc.returncode != 0:
+        logging.warning(f"Erreur de parsing AST : {stderr.strip()}")
+        return None
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as e:
+        logging.warning(f"Sortie JSON invalide du pont AST : {e}")
+        return None
+
+
+def _route_from_attr(attr: Dict, class_route_prefix: str) -> Optional[Dict]:
+    """
+    Construit {"path", "name", "http_methods"} depuis un attribut #[Route(...)]
+    déjà résolu en dict par le pont AST (voir php_ast/parse.php). Les
+    arguments imbriqués (ex: requirements avec sous-tableau) sont déjà
+    résolus sans ambiguïté par l'AST — pas de re-parsing texte ici.
+    """
+    args = attr.get("args", [])
+    positional = [a["value"] for a in args if a.get("name") is None]
+    named = {a["name"]: a["value"] for a in args if a.get("name")}
+
+    raw_path = named.get("path")
+    if raw_path is None and positional:
+        raw_path = positional[0]
+    if not isinstance(raw_path, str):
+        return None  # attribut malformé ou path non littéral — ignoré (best effort)
+
+    if class_route_prefix:
+        path = (class_route_prefix.rstrip('/') + '/' + raw_path.lstrip('/')).replace('//', '/')
+    else:
+        path = raw_path
+
+    methods_val = named.get("methods")
+    http_methods = [str(m).upper() for m in methods_val] if isinstance(methods_val, list) else []
+
+    name_val = named.get("name")
+    return {
+        "path":         path,
+        "name":         name_val if isinstance(name_val, str) else None,
+        "http_methods": http_methods,
+    }
+
+
+def _isgranted_from_attr(attr: Dict) -> Dict:
+    """
+    Construit {"role", "message"} depuis un attribut #[IsGranted(...)]
+    déjà résolu en dict par le pont AST.
+    """
+    args = attr.get("args", [])
+    positional = [a["value"] for a in args if a.get("name") is None]
+    named = {a["name"]: a["value"] for a in args if a.get("name")}
+    role = positional[0] if positional else named.get("attribute")
+    message = named.get("message")
+    return {
+        "role":    role if isinstance(role, str) else None,
+        "message": message if isinstance(message, str) else None,
+    }
+
+
+def _isgranted_from_phpdoc(docblock: Optional[str]) -> List[Dict]:
+    """Fallback @IsGranted en PHPDoc (Symfony < 6) — pas de vraie syntaxe PHP, reste en regex."""
+    if not docblock:
+        return []
+    return [{"role": m.group(1), "message": None} for m in ISGRANTED_PHPDOC_REGEX.finditer(docblock)]
+
+
+def _http_methods_from_phpdoc(docblock: str) -> List[str]:
+    """Fallback methods={...} d'une annotation PHPDoc @Route (Symfony < 6)."""
+    m = PHPDOC_ROUTE_METHODS_REGEX.search(docblock)
+    if not m:
+        return []
+    return [v.strip().strip("'\"").upper() for v in m.group(1).split(",")]
 
 
 def _parse_file_content(content: str) -> Dict:
@@ -503,104 +512,75 @@ def _parse_file_content(content: str) -> Dict:
     - class_route_prefix   : préfixe de route de la classe
     - controller_profile   : profil du contrôleur (web_crud, api, internal, mixed)
 
-    Stratégie en deux passes pour éviter les problèmes de regex greediness :
-    Passe 1 — localiser les positions des mots-clés "function".
-    Passe 2 — remonter dans le texte (fenêtre limitée) pour trouver PHPDoc/attributs.
+    La structure (classes/méthodes/attributs/params) vient du pont AST
+    (_parse_via_ast). Le contenu du corps de chaque méthode continue d'être
+    analysé par _analyze_method_body (regex simples, pas de profondeur).
     """
-    class_name_match = CLASS_NAME_REGEX.search(content)
-    class_name = class_name_match.group(1) if class_name_match else None
-    if not class_name:
+    ast_result = _parse_via_ast(content)
+    if not ast_result or not ast_result.get("class_name"):
         return {}
 
-    # --- Route de classe (préfixe) ---
+    class_name     = ast_result["class_name"]
+    class_attrs    = ast_result.get("class_attributes", [])
+    class_docblock = ast_result.get("class_docblock")
+
+    # --- Préfixe de route de classe ---
     class_route_prefix = ""
-    class_def_start = content.find(f"class {class_name}")
-    if class_def_start != -1:
-        class_header = content[:class_def_start]
-        m = ROUTE_REGEX.search(class_header) or PHPDOC_ROUTE_REGEX.search(class_header)
+    for attr in class_attrs:
+        if attr.get("name") == "Route":
+            route = _route_from_attr(attr, "")
+            if route:
+                class_route_prefix = route["path"]
+                break
+    if not class_route_prefix and class_docblock:
+        m = PHPDOC_ROUTE_REGEX.search(class_docblock)
         if m:
             class_route_prefix = m.group(1)
 
-    # #[IsGranted] au niveau classe
-    class_grants: List[Dict] = []
-    if class_def_start != -1:
-        class_header = content[:class_def_start]
-        class_grants = _extract_isgranted_from_attrs(class_header)
+    # --- #[IsGranted] au niveau classe ---
+    class_grants = [_isgranted_from_attr(a) for a in class_attrs if a.get("name") == "IsGranted"]
+    class_grants += _isgranted_from_phpdoc(class_docblock)
 
-    # On trouve les méthodes (function + paramètres).
-    # Accepte n'importe quel ordre de modificateurs (final/abstract/static/visibilité)
-    # et `function` seul (visibilité publique implicite). Ne capture QUE le nom et les params.
-    FUNC_RE = re.compile(
-        r"(?:(?:public|protected|private|final|abstract|static)\s+)*"
-        r"function\s+"
-        r"([a-zA-Z_\x7f-\xff][a-zA-Z0-9_\x7f-\xff]*)"
-        r"\s*\((.*?)\)"
-        r"(?:\s*:\s*(\??[a-zA-Z0-9_|\\\[\]&]+))?",
-        re.DOTALL
-    )
-
-    methods = []
+    methods: List[Dict] = []
     constructor_params: List[Dict] = []
 
-    for func_m in FUNC_RE.finditer(content):
-        method_name = func_m.group(1)
-        params_str  = func_m.group(2) or ""
-        return_type = func_m.group(3)
-        func_start  = func_m.start()
+    for m_data in ast_result.get("methods", []):
+        method_name = m_data.get("name", "")
+        attrs       = m_data.get("attributes", [])
+        docblock    = m_data.get("docblock")
 
-        # Fenêtre d'analyse arrière :
-        # On cherche la dernière "accolade fermante de corps de méthode" avant func_start.
-        # On détecte deux formes :
-        #   - Accolade en début de ligne (méthodes multi-lignes) :  \n[ \t]*}
-        #   - Accolade en fin de ligne   (méthodes inline)        :  }[ \t]*\n
-        # Cela évite de confondre avec des { } dans des strings (ex. "/{id}").
-        window_start = max(0, func_start - _LOOKBACK_CHARS)
-        raw_window   = content[window_start:func_start]
-
-        close_brace_matches = list(_CLOSE_BRACE_RE.finditer(raw_window))
-        if close_brace_matches:
-            # Couper juste après la dernière accolade fermante détectée
-            cut = close_brace_matches[-1].end()
-            window = raw_window[cut:]
-        else:
-            # Pas de méthode précédente : délimiter au début du corps de classe
-            open_matches = list(_OPEN_CLASS_BRACE_RE.finditer(raw_window))
-            if open_matches:
-                window = raw_window[open_matches[-1].end():]
-            else:
-                window = raw_window
-
-        # PHPDoc : on prend le DERNIER bloc /** ... */ dans la fenêtre
-        phpdoc = ""
-        phpdoc_matches = list(_PHPDOC_BACK_RE.finditer(window))
-        if phpdoc_matches:
-            phpdoc = phpdoc_matches[-1].group(0)
-
-        # Attributs PHP 8 : on prend le DERNIER bloc #[...] dans la fenêtre
-        route_attr = ""
-        attr_matches = list(_ATTR_BACK_RE.finditer(window))
-        if attr_matches:
-            route_attr = attr_matches[-1].group(0)
-
-        # Extraction des paramètres
-        params = _extract_params(params_str)
+        # Paramètres (déjà typés/nommés par l'AST — nettoyage du type cohérent
+        # avec l'ancien comportement : on retire seulement les '?'/'\' en tête)
+        params = []
+        for p in m_data.get("params", []):
+            if not p.get("name"):
+                continue
+            ptype = p.get("type")
+            if ptype:
+                ptype = ptype.lstrip("?\\")
+            params.append({"type": ptype, "name": p["name"]})
         if method_name == "__construct":
             constructor_params = params
 
-        # Extraction MULTI-ROUTES
-        # Au lieu d'une seule route, on extrait toutes les #[Route] du bloc
-        routes = _extract_all_routes(route_attr, class_route_prefix)
+        # Routes depuis les attributs #[Route(...)] (gère nativement les
+        # arguments imbriqués à N niveaux, contrairement à l'ancienne regex)
+        routes = []
+        for attr in attrs:
+            if attr.get("name") == "Route":
+                route = _route_from_attr(attr, class_route_prefix)
+                if route:
+                    routes.append(route)
 
-        # Fallback PHPDoc @Route
-        if not routes:
-            rm = ROUTE_REGEX.search(phpdoc) or PHPDOC_ROUTE_REGEX.search(phpdoc)
+        # Fallback PHPDoc @Route (Symfony < 6)
+        if not routes and docblock:
+            rm = ROUTE_REGEX.search(docblock) or PHPDOC_ROUTE_REGEX.search(docblock)
             if rm:
                 raw_path = rm.group(1)
                 if class_route_prefix:
                     path = (class_route_prefix.rstrip('/') + '/' + raw_path.lstrip('/')).replace('//', '/')
                 else:
                     path = raw_path
-                routes = [{"path": path, "name": None, "http_methods": _extract_http_methods(phpdoc)}]
+                routes = [{"path": path, "name": None, "http_methods": _http_methods_from_phpdoc(docblock)}]
 
         # Fallback convention : si pas de route mais préfixe de classe et méthode spéciale
         if not routes and class_route_prefix and method_name != "__construct":
@@ -610,34 +590,25 @@ def _parse_file_content(content: str) -> Dict:
         # Champ legacy « route » : première route pour rétro-compatibilité
         route = routes[0]["path"] if routes else None
 
-        # #[IsGranted] au niveau méthode
-        method_grants = _extract_isgranted_from_attrs(route_attr)
-        # Chercher aussi dans le PHPDoc
-        method_grants += _extract_isgranted_from_attrs(phpdoc)
+        # #[IsGranted] au niveau méthode + fallback PHPDoc
+        method_grants = [_isgranted_from_attr(a) for a in attrs if a.get("name") == "IsGranted"]
+        method_grants += _isgranted_from_phpdoc(docblock)
 
         # Résumé PHPDoc
         summary = None
-        sm = PHPDOC_SUMMARY_REGEX.search(phpdoc)
-        if sm:
-            raw = sm.group(1) or sm.group(2) or ""
-            summary = raw.strip("* ").strip() or None
+        if docblock:
+            sm = PHPDOC_SUMMARY_REGEX.search(docblock)
+            if sm:
+                raw = sm.group(1) or sm.group(2) or ""
+                summary = raw.strip("* ").strip() or None
 
-        # Analyse enrichie du corps de méthode
-        body_search_start = func_m.end()
-        open_brace_pos    = content.find('{', body_search_start)
-        if open_brace_pos != -1:
-            method_body = _extract_balanced_block(content, open_brace_pos) or ""
-        else:
-            method_body = ""
+        # Analyse du corps de méthode (texte exact extrait par l'AST)
+        body_text = m_data.get("body") or ""
+        body_analysis = _analyze_method_body(body_text)
 
-        body_analysis = _analyze_method_body(method_body)
-
-        # Champs legacy pour rétro-compatibilité
         rendered_template = body_analysis["rendered_template"]
         response_types    = body_analysis["response_types"]
-
-        # Legacy response_type (premier type pour compat)
-        response_type = response_types[0] if response_types else None
+        response_type     = response_types[0] if response_types else None
 
         methods.append({
             "name":          method_name,
@@ -656,10 +627,11 @@ def _parse_file_content(content: str) -> Dict:
             # ── Inchangés ──
             "description":   summary,
             "params":        params,
-            "return_type":   return_type,
+            "return_type":   m_data.get("return_type"),
         })
 
-    # Extraction des propriétés
+    # Extraction des propriétés (inchangé, regex sur le contenu brut — hors
+    # périmètre de ce remplacement, pas de risque de profondeur imbriquée ici)
     properties = []
     PROP_RE = re.compile(
         r"(?:private|protected|public)\s+(?:\?|)"
@@ -669,7 +641,7 @@ def _parse_file_content(content: str) -> Dict:
         properties.append({"type": m.group("type"), "name": m.group("n")})
 
     # Classification du contrôleur ─────────────────────────────
-    controller_profile = _classify_controller(class_name, methods, class_grants)
+    controller_profile = _classify_controller(methods, class_grants)
 
     return {
         "class_name":        class_name,
@@ -692,21 +664,31 @@ def analyze_project_code(project_base_path: str) -> Dict:
     Scanne les répertoires clés d'un projet Symfony et retourne un dictionnaire
     structuré avec contrôleurs, entités, services, repositories, etc.
     """
+    # Conventions Symfony. « Service » et « Services » coexistent selon les
+    # projets : on scanne les deux plutôt que d'en imposer une.
     folders_to_scan = [
-        "Controller", "Entity", "Service", "Repository",
+        "Controller", "Entity", "Service", "Services", "Repository",
         "Command", "Form", "Security",
     ]
 
-    analysis: Dict[str, List] = {f.lower() + "s": [] for f in folders_to_scan}
+    # Les deux orthographes alimentent la MÊME clé. Sans cela « Services »
+    # produirait « servicess », qui remonte jusque dans le type annoncé au
+    # modèle (« La classe PHP X (type: servicess) »).
+    cles = {"Services": "services"}
+    cle = lambda f: cles.get(f, f.lower() + "s")
+
+    analysis: Dict[str, List] = {cle(f): [] for f in folders_to_scan}
     analysis["templates"] = []
+
+    absents: List[str] = []
 
     for folder in folders_to_scan:
         path = os.path.join(project_base_path, "src", folder)
-        key  = folder.lower() + "s"
+        key  = cle(folder)
         logging.info(f"Analyse du dossier : {path}")
 
         if not os.path.isdir(path):
-            logging.debug(f"Dossier inexistant (ignoré) : {path}")
+            absents.append(folder)
             continue
 
         for root, _, files in os.walk(path):
@@ -794,19 +776,19 @@ def analyze_project_code(project_base_path: str) -> Dict:
                     if h_list:
                         parts.append(f"Sections : {', '.join(h_list)}.")
                     if nav_tabs:
-                        parts.append(f"Onglets : {', '.join(nav_tabs[:10])}.")
+                        parts.append(f"Onglets : {', '.join(nav_tabs[:MAX_TWIG_ITEMS])}.")
                     if buttons:
-                        parts.append(f"Boutons : {', '.join(list(dict.fromkeys(buttons))[:10])}.")
+                        parts.append(f"Boutons : {', '.join(list(dict.fromkeys(buttons))[:MAX_TWIG_ITEMS])}.")
                     if hidden_ids:
-                        parts.append(f"IDs cachés : {', '.join(hidden_ids[:10])}.")
+                        parts.append(f"IDs cachés : {', '.join(hidden_ids[:MAX_TWIG_ITEMS])}.")
                     if table_ids:
-                        parts.append(f"IDs tables : {', '.join(table_ids[:5])}.")
+                        parts.append(f"IDs tables : {', '.join(table_ids[:MAX_TWIG_SECONDARY])}.")
                     if links:
-                        parts.append(f"Routes Twig : {', '.join(links[:10])}.")
+                        parts.append(f"Routes Twig : {', '.join(links[:MAX_TWIG_ITEMS])}.")
                     if inputs:
-                        parts.append(f"Champs formulaire : {', '.join(inputs[:10])}.")
+                        parts.append(f"Champs formulaire : {', '.join(inputs[:MAX_TWIG_ITEMS])}.")
                     if includes:
-                        parts.append(f"Inclut : {', '.join(includes[:5])}.")
+                        parts.append(f"Inclut : {', '.join(includes[:MAX_TWIG_SECONDARY])}.")
 
                     analysis["templates"].append({
                         "file":       os.path.relpath(file_path, templates_path),
@@ -820,6 +802,20 @@ def analyze_project_code(project_base_path: str) -> Dict:
                     })
                 except Exception as e:
                     logging.warning(f"Impossible d'analyser le template {file_path}: {e}")
+
+    # Bilan explicite : un dossier absent ne doit jamais passer inaperçu.
+    # Sans cela, un projet dont l'arborescence diffère est analysé à moitié
+    # en silence, et rien ne le signale.
+    trouves = ", ".join(f"{k} ({len(v)})" for k, v in analysis.items() if v)
+    logging.info(f"Analyse terminée — trouvés : {trouves or 'aucun'}")
+    # On ne signale que les catégories restées VIDES : inutile d'alerter sur
+    # « Service » quand le projet écrit « Services » et que la clé est remplie.
+    muets = [f for f in absents if not analysis.get(cle(f))]
+    if muets:
+        logging.warning(
+            f"Dossiers absents de src/, aucune donnée pour : {', '.join(muets)}. "
+            f"Si le projet les nomme autrement, compléter folders_to_scan."
+        )
 
     return analysis
 
