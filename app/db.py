@@ -9,6 +9,52 @@ from typing import List, Dict, Optional
 # entre plusieurs workers uvicorn qui appellent init_schema simultanément.
 _INIT_LOCK_ID = 8472_31415
 
+# ── Dimensions de vecteur acceptées ──────────────────────────────────────────
+# La taille d'un vecteur pgvector fait partie du TYPE de la colonne : elle ne
+# peut donc pas être passée en paramètre lié (`%s`), seule l'interpolation est
+# possible dans le CREATE TABLE. C'est le seul endroit du projet où du SQL est
+# construit par interpolation — d'où la validation stricte ci-dessous.
+#
+# En pratique la valeur vient toujours de `len(embedding)`, donc d'un entier
+# calculé par le modèle, jamais d'une entrée utilisateur. La validation relève
+# de la défense en profondeur : elle garantit que même un appel interne fautif
+# ne peut pas injecter de SQL, plutôt que de reposer sur cette seule promesse.
+MIN_VECTOR_SIZE = 1
+MAX_VECTOR_SIZE = 16000   # limite dure de pgvector pour un index HNSW
+DEFAULT_VECTOR_SIZE = 384  # dimension de paraphrase-multilingual-MiniLM-L12-v2
+
+# Pool de connexions. maxconn borne le nombre de requêtes concurrentes vers
+# PostgreSQL : au-delà, les appels attendent au lieu d'ouvrir des connexions à
+# l'infini. 10 couvre largement l'usage (un utilisateur, quelques générations en
+# tâche de fond) sans saturer le `max_connections` par défaut de PostgreSQL (100).
+DEFAULT_MIN_CONNECTIONS = 1
+DEFAULT_MAX_CONNECTIONS = 10
+
+# Nombre de voisins remontés par défaut lors d'une recherche vectorielle.
+# Les appelants passent une valeur explicite (cf. rag_context.RAG_LIMIT_*) ;
+# celle-ci ne sert que de garde-fou si l'argument est omis.
+DEFAULT_SEARCH_LIMIT = 8
+
+
+def _validate_vector_size(vector_size) -> int:
+    """
+    Valide la dimension avant toute interpolation dans du SQL.
+
+    Refuse tout ce qui n'est pas un entier dans les bornes de pgvector — y
+    compris les booléens, que Python considère comme des entiers.
+    """
+    if isinstance(vector_size, bool) or not isinstance(vector_size, int):
+        raise ValueError(
+            f"vector_size doit être un entier, reçu {type(vector_size).__name__} "
+            f"({vector_size!r})"
+        )
+    if not (MIN_VECTOR_SIZE <= vector_size <= MAX_VECTOR_SIZE):
+        raise ValueError(
+            f"vector_size hors bornes : {vector_size} "
+            f"(attendu entre {MIN_VECTOR_SIZE} et {MAX_VECTOR_SIZE})"
+        )
+    return vector_size
+
 
 class KnowledgeDB:
     """
@@ -18,7 +64,9 @@ class KnowledgeDB:
     Utilise un pool de connexions thread-safe (psycopg2.pool.ThreadedConnectionPool).
     """
 
-    def __init__(self, db_url: str, minconn: int = 1, maxconn: int = 10):
+    def __init__(self, db_url: str,
+                 minconn: int = DEFAULT_MIN_CONNECTIONS,
+                 maxconn: int = DEFAULT_MAX_CONNECTIONS):
         self.db_url = db_url
         self._pool: Optional[pool.ThreadedConnectionPool] = None
         if db_url:
@@ -55,7 +103,7 @@ class KnowledgeDB:
     # Schéma
     # ------------------------------------------------------------------
 
-    def init_schema(self, vector_size: int = 384) -> None:
+    def init_schema(self, vector_size: int = DEFAULT_VECTOR_SIZE) -> None:
         """
         Crée la table project_code_context si elle n'existe pas encore.
         Sérialisé via pg_advisory_lock pour éviter les courses entre workers.
@@ -70,20 +118,27 @@ class KnowledgeDB:
             finally:
                 cur.execute("SELECT pg_advisory_unlock(%s);", (_INIT_LOCK_ID,))
 
-    def reset_schema(self, vector_size: int = 384) -> None:
+    def reset_schema(self, vector_size: int = DEFAULT_VECTOR_SIZE) -> None:
         """
         Supprime et recrée la table principale.
         À utiliser uniquement lors d'un changement de modèle d'embedding.
         Attention toutes les données sont perdues.
         """
         with self._cursor() as cur:
-            cur.execute("DROP TABLE IF EXISTS routes CASCADE;")
-            cur.execute("DROP TABLE IF EXISTS scenarios CASCADE;")
             cur.execute("DROP TABLE IF EXISTS project_code_context CASCADE;")
             self._create_tables(cur, vector_size)
 
     def _create_tables(self, cur, vector_size: int) -> None:
-        """Crée l'extension pgvector et la table de chunks de code."""
+        """
+        Crée l'extension pgvector et la table de chunks de code.
+
+        `vector_size` est interpolé dans le SQL — c'est inévitable, la dimension
+        fait partie du type de colonne et n'accepte pas de paramètre lié. La
+        valeur est donc validée en amont par _validate_vector_size(), qui refuse
+        tout ce qui n'est pas un entier dans les bornes de pgvector. Toutes les
+        autres requêtes du projet utilisent des paramètres liés (%s).
+        """
+        vector_size = _validate_vector_size(vector_size)
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
 
         cur.execute(f"""
@@ -121,35 +176,6 @@ class KnowledgeDB:
     # ------------------------------------------------------------------
     # Sauvegarde
     # ------------------------------------------------------------------
-
-    def save_code_context(
-        self,
-        project_id: str,
-        chunks: List[Dict],
-        vectors: List[List[float]],
-    ) -> None:
-        """Insère les chunks et leurs embeddings. Atomique (commit unique)."""
-        with self._cursor() as cur:
-            data = [
-                (
-                    project_id,
-                    chunk["chunk_type"],
-                    chunk["file_path"],
-                    chunk["class_name"],
-                    chunk["content"],
-                    vector,
-                )
-                for chunk, vector in zip(chunks, vectors)
-            ]
-            execute_values(
-                cur,
-                """
-                INSERT INTO project_code_context
-                    (project_id, chunk_type, file_path, class_name, content, embedding)
-                VALUES %s
-                """,
-                data,
-            )
 
     def reindex_project(
         self,
@@ -193,7 +219,7 @@ class KnowledgeDB:
         self,
         project_id: str,
         query_vector: List[float],
-        limit: int = 8,
+        limit: int = DEFAULT_SEARCH_LIMIT,
     ) -> List[Dict]:
         """Retourne les N chunks de code les plus proches sémantiquement."""
         with self._cursor(commit=False) as cur:

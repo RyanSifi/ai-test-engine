@@ -9,7 +9,10 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore')
 
     database_url: str
-    ollama_url: str = "http://host.docker.internal:11434/api/generate"
+    # Ollama est conteneurisé (service `ollama` du docker-compose) : le défaut
+    # vise le nom du service, pas l'hôte. Pour une exécution hors Docker,
+    # surcharger via .env avec http://localhost:11434/api/generate.
+    ollama_url: str = "http://ollama:11434/api/generate"
     default_embedding_model: str = 'paraphrase-multilingual-MiniLM-L12-v2'
     default_llm_model: str = 'qwen2.5-coder:3b'
     # Réglages d'inférence LLM (surchargeables via .env). Sur CPU, num_predict est

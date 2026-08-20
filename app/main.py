@@ -1,21 +1,20 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse
 from pathlib import Path
+# requests n'est plus appelé directement ici (déplacé dans llm_client.py),
+# mais l'import doit rester : test_main.py patche `main.requests.post`.
 import requests
 import re
-from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import os
-import subprocess
-import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import lru_cache
 import logging
-import json
 from code_parser import analyze_project_code, extract_code_for_symbol
+from chunk_format import MAX_METHOD_H1, MAX_METHOD_FIELDS
 from config import settings
 from brain import SemanticEngine
 from db import KnowledgeDB
@@ -30,7 +29,13 @@ logging.basicConfig(
 
 @lru_cache
 def get_db() -> KnowledgeDB:
-    return KnowledgeDB(os.getenv("DATABASE_URL"))
+    # settings.database_url et NON os.getenv("DATABASE_URL") : os.getenv ne lit que
+    # les variables du processus, jamais le fichier .env. Une installation locale
+    # (hors Docker) configurée uniquement par .env — le mode décrit dans le README —
+    # recevait donc None et ne pouvait pas se connecter. En Docker rien ne change :
+    # docker-compose.yml pose de vraies variables d'environnement, que pydantic-settings
+    # lit en priorité sur le fichier.
+    return KnowledgeDB(settings.database_url)
 
 
 def _allowed_embedding_models() -> set:
@@ -123,14 +128,18 @@ app = FastAPI(
     ],
 )
 
-# CORS — toujours activé pour autoriser la console HTML (localhost)
+# CORS — activé uniquement si CORS_ORIGINS est défini. Vide = désactivé
+# (cohérent avec le README et le message loggé au démarrage dans lifespan()).
+# La console HTML (/ui) est servie en same-origin par brain-api : elle n'a pas
+# besoin de CORS pour fonctionner, contrairement à un appelant cross-origin.
 _cors_origins = [o.strip() for o in (settings.cors_origins or "").split(",") if o.strip()]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins if _cors_origins else ["*"],
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["X-API-Key", "Content-Type"],
-)
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["X-API-Key", "Content-Type"],
+    )
 
 # Console HTML
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -141,1137 +150,69 @@ async def console_ui():
     return (_STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
 
-# MODÈLES PYDANTIC
-# Contraintes communes pour bloquer les inputs farfelus avant qu'ils n'atteignent
-# les colonnes VARCHAR(100) de la DB ou l'écriture de fichiers.
-_PROJECT_ID_PATTERN = r"^[a-zA-Z0-9_.-]+$"
-
-
-class LearnFromCodeRequest(BaseModel):
-    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    model_name: Optional[str] = Field(
-        default=None,
-        max_length=200,
-        json_schema_extra={"examples": [settings.default_embedding_model]},
-    )
-    model_config = {"protected_namespaces": ()}
-
-    def model_post_init(self, __ctx) -> None:
-        if not self.model_name or self.model_name == "string":
-            self.model_name = settings.default_embedding_model
-
-
-class GenerateTestRequest(BaseModel):
-    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    description: str = Field(..., min_length=1, max_length=4000)
-    test_name: Optional[str] = Field(default=None, max_length=200)
-    class_name: Optional[str] = Field(default=None, max_length=255)
-    model_name: Optional[str] = Field(default=None, max_length=200)
-    deterministic: bool = False  # True = bypass LLM, génération depuis les chunks
-    async_mode: bool = False    # True = retourne job_id immédiatement, poll /job/{id}/status
-    model_config = {"protected_namespaces": ()}
-
-    def model_post_init(self, __ctx) -> None:
-        if not self.model_name:
-            self.model_name = settings.default_embedding_model
-
-
-class GenerateUnitTestRequest(BaseModel):
-    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    file_path: str = Field(..., min_length=1, max_length=500)
-    class_name: str = Field(..., min_length=1, max_length=255)
-    method_name: Optional[str] = Field(default=None, max_length=255)
-    description: str = Field(..., min_length=1, max_length=4000)
-    test_name: Optional[str] = Field(default=None, max_length=200)
-    model_name: Optional[str] = Field(default=None, max_length=200)
-    async_mode: bool = False
-    model_config = {"protected_namespaces": ()}
-
-    def model_post_init(self, __ctx) -> None:
-        if not self.model_name:
-            self.model_name = settings.default_embedding_model
-
-
-class ResetSchemaRequest(BaseModel):
-    confirm: bool = False
-
-
+# MODÈLES PYDANTIC (voir models.py)
+from models import (  # noqa: E402
+    LearnFromCodeRequest,
+    GenerateTestRequest,
+    GenerateUnitTestRequest,
+    ResetSchemaRequest,
+    GenerateTestsBatchRequest,
+)
 
 # HELPERS
 
-def validate_php_syntax(code: str) -> Optional[str]:
-    """Valide la syntaxe PHP. Retourne le message d'erreur ou None si OK."""
-    try:
-        proc = subprocess.Popen(
-            ["php", "-l"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = proc.communicate(input=code)
-        return (stderr or stdout).strip() if proc.returncode != 0 else None
-    except FileNotFoundError:
-        logging.warning("PHP non disponible — validation de syntaxe ignorée.")
-        return None
-
-
-MAX_SHOT_CHARS = 3500
-
-def _load_golden_dataset(filename: str, profile: str = "") -> List[Dict]:
-    """
-    Charge le golden dataset et sélectionne l'exemple le plus pertinent
-    selon le profil du contrôleur (web_crud, api, mixed, etc.).
-    Retourne toujours 1 seul exemple pour garder le prompt court.
-    """
-    path = os.path.join(os.path.dirname(__file__), filename)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            dataset = json.load(f)
-    except Exception as e:
-        logging.warning(f"Impossible de charger {filename}: {e}")
-        return []
-
-    for ex in dataset:
-        ti = ex.get("test_ideal", "")
-        if len(ti) > MAX_SHOT_CHARS:
-            truncated = ti[:MAX_SHOT_CHARS]
-            # Équilibrage approximatif des accolades : on referme autant de blocs
-            # ouverts que nécessaire au lieu d'ajouter un `}` aveugle qui pouvait
-            # produire du PHP invalide en few-shot.
-            missing = max(0, truncated.count('{') - truncated.count('}'))
-            ex["test_ideal"] = truncated + "\n// [tronqué]\n" + ("}" * missing)
-
-    if not dataset:
-        return []
-
-    # Keywords disjoints — un même mot-clé ne doit pas appartenir à 2 profils
-    # (sinon le premier dans l'ordre d'itération gagne arbitrairement).
-    PROFILE_KEYWORDS = {
-        "api":      ["xhr", "api", "ajax"],
-        "mixed":    ["mixte", "mixed"],
-        "web_crud": ["crud", "formulaire", "form", "redirect"],
-    }
-
-    keywords = PROFILE_KEYWORDS.get(profile, [])
-    if keywords:
-        for ex in dataset:
-            demand = ex.get("demande_utilisateur", "").lower()
-            if any(kw in demand for kw in keywords):
-                logging.info(f"[few-shot] Exemple sélectionné pour profil '{profile}' : {demand[:60]}")
-                return [ex]
-
-    logging.info(f"[few-shot] Fallback premier exemple (profil='{profile}')")
-    return [dataset[0]]
-
-
-MAX_PROMPT_CHARS = 12_000
-
-def _check_ollama_alive(base_url: str, timeout: int = 5) -> bool:
-    """Vérifie qu'Ollama répond avant d'envoyer un prompt."""
-    try:
-        health_url = base_url.replace("/api/generate", "") + "/api/tags"
-        r = requests.get(health_url, timeout=timeout)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-def _call_llm(prompt: str, timeout: int = 600, _skip_health: bool = False) -> str:
-    """
-    Appelle Ollama et retourne le texte généré (nettoyé des balises markdown).
-    `_skip_health` : permet de zapper le health-check sur les retries quand
-    on vient d'avoir un appel réussi (évite N+1 health-checks).
-    """
-    if not _skip_health and not _check_ollama_alive(settings.ollama_url):
-        raise RuntimeError(
-            f"Ollama injoignable — vérifiez que le service tourne sur {settings.ollama_url}"
-        )
-    if len(prompt) > MAX_PROMPT_CHARS:
-        logging.warning(f"[_call_llm] Prompt tronqué : {len(prompt)} → {MAX_PROMPT_CHARS} chars")
-        prompt = prompt[:MAX_PROMPT_CHARS]
-
-    estimated_tokens = len(prompt) // 3
-    logging.info(f"[_call_llm] ~{estimated_tokens} tokens estimés, num_ctx={settings.llm_num_ctx}")
-    if estimated_tokens > 6500:
-        logging.warning("[_call_llm] Prompt dépasse 6500 tokens — risque de troncature LLM")
-
-    resp = requests.post(
-        settings.ollama_url,
-        json={
-            "model":  settings.default_llm_model,
-            "prompt": prompt,
-            "stream": True,
-            # keep_alive est un champ de premier niveau (pas dans options) : il
-            # garde le modèle en RAM entre deux appels → pas de rechargement.
-            "keep_alive": settings.llm_keep_alive,
-            "options": {
-                "temperature":  0.1,
-                "stop":         ["<|im_end|>"],
-                "num_ctx":      settings.llm_num_ctx,
-                "num_predict":  settings.llm_num_predict,
-            },
-        },
-        stream=True,
-        timeout=(10, timeout),
-    )
-    resp.raise_for_status()
-
-    code_parts = []
-    eval_count = 0
-    start = time.time()
-
-    for line in resp.iter_lines():
-        if not line:
-            continue
-        try:
-            chunk = json.loads(line)
-        except json.JSONDecodeError:
-            # Ollama renvoie occasionnellement des lignes non-JSON (logs internes,
-            # message d'erreur). On les ignore plutôt que de tuer la génération.
-            logging.debug(f"[_call_llm] ligne ignorée (non-JSON) : {line[:100]!r}")
-            continue
-        code_parts.append(chunk.get("response", ""))
-        eval_count += 1
-        if chunk.get("done"):
-            break
-
-    elapsed = round(time.time() - start, 1)
-    logging.info(f"[_call_llm] {eval_count} tokens en {elapsed}s")
-
-    code = "".join(code_parts).strip()
-    return code.replace("```php", "").replace("```", "").strip()
-
-
-def _safe_join(base: str, *parts: str) -> str:
-    """
-    Joint et résout un chemin relatif sous `base`.
-    Lève HTTPException(400) si le résultat sort de `base` (path traversal).
-    """
-    base_real = os.path.realpath(base)
-    candidate = os.path.realpath(os.path.join(base_real, *parts))
-    # Comparaison avec un séparateur final pour empêcher /workspace-evil de matcher /workspace
-    if candidate != base_real and not candidate.startswith(base_real + os.sep):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Chemin invalide (hors workspace) : {os.path.join(*parts)}",
-        )
-    return candidate
-
-
-def _sanitize_path_component(name: str) -> str:
-    """Garde uniquement les caractères sûrs pour un nom de fichier ou dossier."""
-    return re.sub(r"[^a-zA-Z0-9_-]", "", name) or "Unnamed"
-
-
-def _write_php_file(relative_path: str, code: str) -> str:
-    """Écrit un fichier PHP dans le workspace et retourne son chemin absolu."""
-    full_path = _safe_join(settings.container_project_root, relative_path)
-    os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, "w", encoding="utf-8") as f:
-        f.write(code)
-    return full_path
-
-
-def _build_prompt(system: str, few_shots: List[Dict], user: str) -> str:
-    """
-    Construit le prompt selon le format du modèle configuré.
-    - Qwen / Mistral / Phi : format <|im_start|> / <|im_end|>
-    - Gemma / autres       : format texte brut ### Instructions / ### Tâche
-    """
-    model = settings.default_llm_model.lower()
-    is_chatml = any(k in model for k in ("qwen", "mistral", "phi"))
-
-    if is_chatml:
-        shots = ""
-        for ex in few_shots:
-            shots += (
-                f"<|im_end|>\n<|im_start|>user\nScénario: {ex['demande_utilisateur']}\n"
-                f"<|im_end|>\n<|im_start|>assistant\n{ex['test_ideal']}\n"
-            )
-        return (
-            f"<|im_start|>system\n{system}\n"
-            f"{shots}"
-            f"<|im_end|>\n<|im_start|>user\nScénario: {user}\n"
-            f"<|im_end|>\n<|im_start|>assistant\n"
-        )
-    else:
-        shots = ""
-        for ex in few_shots:
-            shots += (
-                f"\n### Exemple\nScénario: {ex['demande_utilisateur']}\n"
-                f"Réponse:\n{ex['test_ideal']}\n"
-            )
-        return (
-            f"### Instructions\n{system}\n"
-            f"{shots}"
-            f"\n### Tâche\nScénario: {user}\n"
-            f"Réponse:\n"
-        )
-
-
-def _build_context_str(context_chunks: List[Dict]) -> str:
-    """Formate les chunks RAG en bloc de texte pour le prompt."""
-    if not context_chunks:
-        return "CONTEXTE : Aucun contexte trouvé pour ce projet.\n"
-    lines = ["CONTEXTE RÉEL DU PROJET (NE PAS INVENTER) :"]
-    for c in context_chunks:
-        lines.append(f"- {c['content']} (Fichier: {c['file_path']})")
-    return "\n".join(lines) + "\n"
-
-def _build_routes_summary(context_chunks: List[Dict]) -> str:
-    """Extrait la liste des routes depuis les chunks pour la passer au LLM."""
-    lines = []
-    for c in context_chunks:
-        content = c.get("content", "")
-        if "Route:" not in content:
-            continue
-        method = re.search(r"Méthode '([^']+)'", content)
-        route  = re.search(r"Route:\s*([^\s—\n]+)", content)
-        rtype  = re.search(r"→ Type de réponse:\s*(.+)", content)
-        if method and route:
-            rtype_str = rtype.group(1).strip() if rtype else "(type non détecté)"
-            line = f"  - {method.group(1)}: {route.group(1)} → {rtype_str}"
-
-            # Enrichir le résumé avec les métadonnées
-            verb_m = _RE_HTTP_VERBS.search(content)
-            if verb_m:
-                line += f" [{verb_m.group(1).strip()}]"
-
-            if _RE_AJAX_ONLY.search(content):
-                line += " [AJAX]"
-
-            form_m = _RE_FORM_TYPE.search(content)
-            if form_m:
-                line += f" [Form: {form_m.group(1).strip()}]"
-
-            role_m = _RE_METHOD_ROLE.search(content)
-            if role_m:
-                line += f" [Rôle: {role_m.group(1).strip()}]"
-
-            voter_m = _RE_VOTER.search(content)
-            if voter_m:
-                line += f" [Voter: {voter_m.group(1)}]"
-            lines.append(line)
-    if not lines:
-        return ""
-    return "ROUTES À TESTER (exhaustif, ne pas en oublier) :\n" + "\n".join(lines)
-
-def _validate_coverage(generated_code: str, context_chunks: List[Dict]) -> List[str]:
-    """
-    Retourne la liste des routes présentes dans les chunks
-    mais absentes du code généré.
-
-    Les paramètres dynamiques {id} sont remplacés par un wildcard non-quote,
-    de sorte que /foo/{id} matche /foo/1 ou /foo/dupont dans le code généré.
-    """
-    missing = []
-    for c in context_chunks:
-        route_m = re.search(r"Route:\s*([^\s—\n]+)", c["content"])
-        if not route_m:
-            continue
-        route = route_m.group(1)
-        # Découper la route sur les paramètres {…}, échapper les segments littéraux
-        # puis joindre avec le wildcard. Évite l'écueil de re.escape qui transforme
-        # {id} en \{id\} et casse une substitution naïve.
-        literal_parts = re.split(r"\{[^}]+\}", route)
-        route_pattern = r"[^'\"\s]+".join(re.escape(p) for p in literal_parts)
-        if not re.search(route_pattern, generated_code):
-            missing.append(route)
-    return missing
-
-def filter_chunks_by_class(chunks: List[Dict], class_name: str) -> List[Dict]:
-    """
-    Filtre post-retrieval pour réduire le bruit contextuel.
-    """
-    if not class_name:
-        return chunks
-    name_lower = class_name.lower()
-    primary   = [c for c in chunks if name_lower in c["content"].lower()]
-    secondary = [
-        c for c in chunks
-        if name_lower not in c["content"].lower()
-        and c.get("chunk_type") != "template_info"  # exclut les templates hors-sujet
-        and c.get("similarity", 0.0) >= 0.65
-    ]
-    return primary + secondary[:3]
-
-
-# GÉNÉRATEUR DÉTERMINISTE — bypass LLM pour les WebTestCase
-# Regex pour parser le contenu des chunks de méthode enrichis
-_RE_METHOD_NAME   = re.compile(r"Méthode '([^']+)'")
-_RE_ROUTE         = re.compile(r"Route:\s*([^\s—\n]+)")
-_RE_RESPONSE_TYPE = re.compile(r"→ Type de réponse:\s*(.+)")
-_RE_H1            = re.compile(r"→ H1:\s*(.+)")
-_RE_HIDDEN_IDS    = re.compile(r"→ IDs cachés:\s*(.+)")
-_RE_CONSTRUCTOR   = re.compile(r"constructeur injecte\s*:\s*\(([^)]+)\)")
-_RE_ROUTE_PARAM   = re.compile(r"\{(\w+)\}")
-
-# Regex enrichies
-_RE_HTTP_VERBS    = re.compile(r"→ Verbes HTTP:\s*(.+)")
-_RE_AJAX_ONLY     = re.compile(r"→ AJAX uniquement")
-_RE_FORM_TYPE     = re.compile(r"→ Formulaire:\s*(.+)")
-_RE_VOTER         = re.compile(r"→ Voter:\s*denyAccessUnlessGranted\('([^']+)'")
-_RE_CLASS_ROLES   = re.compile(r"→ Rôles classe:\s*(.+)")
-_RE_METHOD_ROLE   = re.compile(r"→ Rôle requis \(méthode\):\s*(.+)")
-_RE_PROFILE       = re.compile(r"→ Profil:\s*(\w+)")
-_RE_INTERNAL      = re.compile(r"→ Pas de route HTTP")
-
-# Valeurs de substitution réalistes pour les paramètres de route courants
-_PARAM_DEFAULTS: Dict[str, str] = {
-    "id":   "1",
-    "nom":  "dupont",
-    "name": "dupont",
-    "slug": "exemple",
-    "page": "1",
-    "type": "test",
-    "code": "001",
-    "tab":  "general",
-    "filename": "export.csv",
-}
-
-
-def _resolve_route(route: str) -> str:
-    """Remplace les paramètres dynamiques {param} par des valeurs de test."""
-    def replace(m: re.Match) -> str:
-        param = m.group(1)
-        return _PARAM_DEFAULTS.get(param.lower(), "test")
-    return _RE_ROUTE_PARAM.sub(replace, route)
-
-
-@lru_cache(maxsize=1)
-def _role_key_map() -> Dict[str, str]:
-    """
-    Parse settings.auth_role_key_map ("ROLE_A:KEY_A,ROLE_B:KEY_B") une seule fois.
-    Le cache est invalidé naturellement si le process redémarre (settings est figé).
-    """
-    raw = settings.auth_role_key_map or ""
-    mapping: Dict[str, str] = {}
-    for pair in raw.split(","):
-        if ":" not in pair:
-            continue
-        src, dst = pair.split(":", 1)
-        mapping[src.strip()] = dst.strip()
-    return mapping
-
-
-def _role_to_factory_key(role: str) -> str:
-    """
-    Mappe un rôle Symfony (ex: ROLE_PARCOURS) vers la clé attendue par TestUserFactory.
-    Sans mapping, le rôle est retourné tel quel.
-    """
-    return _role_key_map().get(role, role)
-
-
-def _detect_controller_profile(chunks: List[Dict]) -> str:
-    """
-    Détecte le profil du contrôleur depuis les chunks indexés.
-    Retourne : 'web_crud', 'api', 'internal', 'mixed'.
-    """
-    for c in chunks:
-        m = _RE_PROFILE.search(c.get("content", ""))
-        if m:
-            return m.group(1)
-    # Fallback : si aucun chunk de classe n'a de profil, déduire des méthodes
-    has_routes   = any(_RE_ROUTE.search(c.get("content", "")) for c in chunks)
-    has_internal = any(_RE_INTERNAL.search(c.get("content", "")) for c in chunks)
-    if not has_routes and has_internal:
-        return "internal"
-    return "web_crud"
-
-
-def _detect_class_role(chunks: List[Dict]) -> str:
-    """
-    Trouve le rôle requis au niveau classe depuis les chunks.
-    Retourne le premier rôle trouvé ou 'ADMIN' par défaut.
-    """
-    for c in chunks:
-        m = _RE_CLASS_ROLES.search(c.get("content", ""))
-        if m:
-            roles = [r.strip() for r in m.group(1).split(",")]
-            return roles[0]  # Premier rôle = rôle principal
-    return "ADMIN"
-
-
-def _extract_method_role(content: str, class_role: str) -> str:
-    """
-    Retourne le rôle à utiliser pour tester une méthode :
-    le rôle spécifique de la méthode s'il existe, sinon le rôle de la classe.
-    """
-    m = _RE_METHOD_ROLE.search(content)
-    if m:
-        return m.group(1).strip()
-    return class_role
-
-
-# Heuristiques de détection des verbes HTTP par nom de méthode et de route.
-# Utilisé en fallback quand #[Route(methods: [...])] n'est pas explicite.
-_VERB_NAME_HINTS = {
-    "DELETE": ("delete", "remove", "destroy", "trash", "erase", "unlink"),
-    "PUT":    ("update", "edit", "modify", "replace", "put"),
-    "PATCH":  ("patch", "toggle", "enable", "disable", "activate", "deactivate"),
-    "POST":   ("create", "add", "new", "save", "store", "submit", "send",
-               "post", "register", "ajout", "ajouter", "creer", "creation",
-               "valider", "soumettre", "publier", "envoyer"),
-}
-
-
-def _infer_http_verb_from_name(method_name: str, route_path: str) -> Optional[str]:
-    """Infère un verbe HTTP depuis le nom de méthode ou la route, en français/anglais."""
-    name_l = method_name.lower()
-    route_l = route_path.lower() if route_path else ""
-
-    for verb, hints in _VERB_NAME_HINTS.items():
-        for hint in hints:
-            # Préfixe de méthode (deleteFoo, updateBar) ou suffixe de route (/delete, /update)
-            if name_l.startswith(hint) or f"/{hint}" in route_l or route_l.endswith(hint):
-                return verb
-    return None
-
-
-_RE_BODY_INFERRED_VERB = re.compile(r"→ Verbe HTTP inféré \(body\):\s*([A-Z]+)")
-
-
-def _infer_http_verb_from_body(content: str) -> Optional[str]:
-    """
-    Récupère le verbe HTTP inféré par l'analyse profonde du body au moment de
-    l'indexation (cf. code_parser._analyze_method_body : isMethod, $request->request,
-    upload de fichiers, formulaire détecté).
-    """
-    m = _RE_BODY_INFERRED_VERB.search(content)
-    if m:
-        return m.group(1).strip()
-    # Fallback sur le marqueur Formulaire (compat ancien index)
-    if "Formulaire:" in content or "→ Formulaire" in content:
-        return "POST"
-    return None
-
-
-def _extract_http_verb(content: str, method_name: str = "", route_path: str = "") -> str:
-    """
-    Détermine le verbe HTTP à utiliser pour un test, par ordre de priorité :
-      1. Verbe explicite déclaré dans #[Route(methods: [...])]
-      2. Indices dans le body de la méthode (formulaire, etc.)
-      3. Heuristique sur le nom de méthode (delete*, update*, etc.) ou la route
-      4. GET par défaut
-    """
-    # Verbe explicite
-    m = _RE_HTTP_VERBS.search(content)
-    if m:
-        verbs = [v.strip() for v in m.group(1).split(",") if v.strip()]
-        # Multi-verbes : prioriser POST > PUT > DELETE > PATCH > GET
-        for preferred in ("POST", "PUT", "DELETE", "PATCH", "GET"):
-            if preferred in verbs:
-                return preferred
-        if verbs:
-            return verbs[0]
-
-    # Indices dans le body
-    inferred = _infer_http_verb_from_body(content)
-    if inferred:
-        return inferred
-
-    # Heuristique nom + route
-    inferred = _infer_http_verb_from_name(method_name, route_path)
-    if inferred:
-        return inferred
-
-    return "GET"
-
-
-def _generate_php_test_from_chunks(
-    chunks: List[Dict],
-    class_name: str,
-    test_class_name: str,
-) -> str:
-    """
-    Génère un fichier de test WebTestCase PHP directement depuis les chunks indexés,
-    sans passer par le LLM. Élimine toute hallucination structurelle.
-
-    Architecture « scénarios dynamiques » :
-    Chaque méthode est analysée et accumule une liste de scénarios de test.
-    Chaque scénario est un dict qui décrit un test PHP à générer.
-    Ajouter un nouveau pattern = ajouter un builder dans SCENARIO_BUILDERS.
-    """
-    class_role        = _detect_class_role(chunks)
-    class_factory_key = _role_to_factory_key(class_role)
-    all_roles         = [r.strip() for r in settings.auth_test_roles.split(",")]
-    secondary_roles   = [r for r in all_roles if r != class_factory_key]
-    fw            = settings.auth_firewall_name
-    redirect_path = settings.auth_redirect_path
-    redirect_code = settings.auth_redirect_status
-    methods_seen: set    = set()
-    test_methods: list   = []
-    skipped_private: list = []
-
-    for chunk in chunks:
-        content = chunk.get("content", "")
-        if not content.startswith("Méthode '"):
-            continue
-
-        method_m = _RE_METHOD_NAME.search(content)
-        if not method_m:
-            continue
-        method_name = method_m.group(1)
-
-        if method_name in methods_seen or method_name == "__construct":
-            continue
-        methods_seen.add(method_name)
-
-        route_m = _RE_ROUTE.search(content)
-        if not route_m:
-            skipped_private.append(method_name)
-            continue
-
-        # Extraire les métadonnées du chunk
-        ctx = _parse_chunk_metadata(content, route_m.group(1), class_role)
-
-        # Accumuler les scénarios applicables
-        scenarios = []
-        for builder in SCENARIO_BUILDERS:
-            scenarios.extend(builder(ctx, fw, redirect_path, redirect_code, secondary_roles))
-
-        # Générer le code PHP pour chaque scénario
-        for sc in scenarios:
-            test_methods.append(_render_scenario(sc))
-
-    # Commentaires pour méthodes sans route
-    private_comment = ""
-    if skipped_private:
-        names = ", ".join(skipped_private)
-        private_comment = f"\n    // Méthodes sans route HTTP (non testées ici) : {names}\n"
-
-    # Assemblage final
-    body          = "\n\n".join(test_methods)
-    factory       = settings.auth_test_class
-    sso_user      = settings.auth_sso_user_class
-    factory_short = factory.split("\\")[-1]
-    sso_short     = sso_user.split("\\")[-1]
-
-    php = (
-        "<?php\n\n"
-        "namespace App\\Tests\\Functional\\Controller;\n\n"
-        f"use {factory};\n"
-        f"use {sso_user};\n"
-        "use Symfony\\Bundle\\FrameworkBundle\\KernelBrowser;\n"
-        "use Symfony\\Bundle\\FrameworkBundle\\Test\\WebTestCase;\n"
-        "use Symfony\\Component\\HttpFoundation\\Response;\n\n"
-        f"final class {test_class_name} extends WebTestCase\n"
-        "{\n"
-        "    protected KernelBrowser $client;\n"
-        f"    private {factory_short} $testUserFactory;\n\n"
-        "    protected function setUp(): void\n"
-        "    {\n"
-        "        $this->client = self::createClient();\n"
-        f"        $this->testUserFactory = $this->client->getContainer()->get({factory_short}::class);\n"
-        "    }\n\n"
-        f"    private function getTestUser(string $key): {sso_short}\n"
-        "    {\n"
-        "        return $this->testUserFactory->create($key);\n"
-        "    }\n"
-        f"{private_comment}"
-        f"\n{body}\n"
-        "}\n"
-    )
-    return php
-
-
-# Squelette de DataFixtures
-
-# Types à exclure (frameworks, services, etc. — pas des entités métier à mocker)
-_NON_ENTITY_TYPES = {
-    "Request", "Response", "Session", "ContainerInterface",
-    "EntityManagerInterface", "EntityManager", "ManagerRegistry",
-    "FormFactoryInterface", "RouterInterface", "TranslatorInterface",
-    "LoggerInterface", "EventDispatcherInterface", "ParameterBagInterface",
-    "DataTableQuery", "Security", "TokenStorageInterface",
-    "AuthorizationCheckerInterface", "FormView", "FormBuilderInterface",
-    "string", "int", "float", "bool", "array", "object", "mixed",
-    "Yaml", "AbstractController",
-}
-
-_RE_PARAMS_LINE = re.compile(r"Params:\s*\(([^)]*)\)")
-
-
-def _extract_entity_types_from_chunks(chunks: List[Dict]) -> List[str]:
-    """
-    Récupère les types d'entités potentiels apparaissant dans les paramètres
-    de méthode des chunks (ex : 'Creance', 'CreanceRegroupee').
-    Filtre les types techniques (Request, EntityManager, etc.).
-    """
-    found: Dict[str, int] = {}
-    for c in chunks:
-        content = c.get("content", "")
-        for params_match in _RE_PARAMS_LINE.finditer(content):
-            params_blob = params_match.group(1)
-            # Chaque paramètre : "Type $name"
-            for part in params_blob.split(","):
-                tokens = part.strip().split()
-                if len(tokens) < 2:
-                    continue
-                # Premier token = type (peut être "?Type")
-                t = tokens[0].lstrip("?\\")
-                if not t or not t[0].isupper():
-                    continue
-                if t in _NON_ENTITY_TYPES:
-                    continue
-                if t.endswith("Service") or t.endswith("Manager") or t.endswith("Repository"):
-                    continue
-                if t.endswith("Type"):  # FormType
-                    continue
-                found[t] = found.get(t, 0) + 1
-    # Trier par fréquence décroissante
-    return sorted(found.keys(), key=lambda k: (-found[k], k))
-
-
-def _generate_fixtures_skeleton(
-    entity_types: List[str],
-    test_class_name: str,
-) -> str:
-    """
-    Génère un squelette PHP DataFixtures à compléter manuellement par la MOA.
-    Crée une entité minimale par type détecté, à id=1 (valeur par défaut des tests).
-    """
-    if not entity_types:
-        return ""
-
-    use_lines = "\n".join(f"// use App\\Entity\\{t};" for t in entity_types)
-    todos = []
-    for t in entity_types:
-        var = t[0].lower() + t[1:]
-        todos.append(
-            f"        // TODO: créer une instance de {t} pour les tests\n"
-            f"        // ${var} = new {t}();\n"
-            f"        // $manager->persist(${var});\n"
-            f"        // $this->addReference('{t.lower()}_test_1', ${var});"
-        )
-    todos_block = "\n\n".join(todos)
-
-    fixtures_class_name = test_class_name + "Fixtures"
-    php = f"""<?php
-
-namespace App\\Tests\\Functional\\Fixtures;
-
-{use_lines}
-use Doctrine\\Bundle\\FixturesBundle\\Fixture;
-use Doctrine\\Persistence\\ObjectManager;
-
-/**
- * Fixtures squelette auto-générées pour {test_class_name}.
- *
- * À COMPLÉTER : décommente les stubs ci-dessous et ajuste les setters
- * aux contraintes de ton domaine. Les tests utilisent par défaut id=1
- * pour les paramètres de route.
- *
- * Activation dans config/packages/test/doctrine.yaml :
- *   doctrine:
- *     dbal:
- *       url: 'sqlite:///:memory:'
- *
- * Chargement avant chaque test :
- *   php bin/console doctrine:fixtures:load --env=test --no-interaction
- */
-final class {fixtures_class_name} extends Fixture
-{{
-    public function load(ObjectManager $manager): void
-    {{
-{todos_block}
-
-        $manager->flush();
-    }}
-}}
-"""
-    return php
-
-
-# MOTEUR DE SCÉNARIOS
-
-def _parse_chunk_metadata(content: str, raw_route: str, class_role: str) -> Dict:
-    """
-    Parse toutes les métadonnées d'un chunk de méthode en un dict plat
-    réutilisable par tous les builders de scénarios.
-    """
-    method_m   = _RE_METHOD_NAME.search(content)
-    method_name = method_m.group(1) if method_m else "unknown"
-    cap         = method_name[0].upper() + method_name[1:]
-
-    rtype_matches  = _RE_RESPONSE_TYPE.findall(content)
-    response_types = [r.strip() for r in rtype_matches]
-
-    h1_m       = _RE_H1.search(content)
-    hidden_m   = _RE_HIDDEN_IDS.search(content)
-    form_m     = _RE_FORM_TYPE.search(content)
-    voter_m    = _RE_VOTER.search(content)
-
-    method_role = _extract_method_role(content, class_role)
-
-    return {
-        "method_name":    method_name,
-        "cap":            cap,
-        "raw_route":      raw_route,
-        "route":          _resolve_route(raw_route),
-        "http_verb":      _extract_http_verb(content, method_name, raw_route),
-        "method_role":    method_role,
-        "class_role":     class_role,
-        # Clés mappées pour getTestUser() — différentes de method_role si auth_role_key_map est défini
-        "factory_key":       _role_to_factory_key(method_role),
-        "class_factory_key": _role_to_factory_key(class_role),
-        "role_label":        _role_to_factory_key(method_role).replace("ROLE_", "").title(),
-        "response_types": response_types,
-        "has_render":     any("render"   in r for r in response_types),
-        "has_redirect":   any("redirect" in r for r in response_types),
-        "has_json":       any("json"     in r for r in response_types),
-        "has_file":       any("file_download" in r or "binary" in r for r in response_types),
-        "has_export":     any("export"   in r for r in response_types),
-        "is_ajax":        bool(_RE_AJAX_ONLY.search(content)),
-        "has_form":       form_m is not None,
-        "form_type":      form_m.group(1).strip() if form_m else None,
-        "has_voter":      voter_m is not None,
-        "voter_attr":     voter_m.group(1) if voter_m else None,
-        "h1":             h1_m.group(1).strip().split(",")[0].strip() if h1_m else "",
-        "hidden_ids":     [i.strip() for i in hidden_m.group(1).split(",")] if hidden_m else [],
-    }
-
-
-def _render_scenario(sc: Dict) -> str:
-    """Transforme un scénario en méthode de test PHP."""
-    lines = []
-    if sc.get("comment"):
-        lines.append(f"    /** {sc['comment']} */")
-    lines.append(f"    public function {sc['func_name']}(): void")
-    lines.append("    {")
-    for line in sc.get("body", []):
-        lines.append(f"        {line}")
-    lines.append("    }")
-    return "\n".join(lines)
-
-
-# BUILDERS DE SCÉNARIOS — chaque builder retourne 0..N scénarios
-#
-# Pour ajouter un nouveau pattern de test :
-#   Écrire une fonction (ctx, fw, redirect, code, sec_roles) -> List[Dict]
-#   L'ajouter à SCENARIO_BUILDERS en bas de cette section
-
-def _scenario_noauth(ctx, fw, redirect_path, redirect_code, _sec_roles):
-    """Non authentifié → redirect vers le SSO."""
-    return [{
-        "comment":   f"{ctx['raw_route']} — non authentifié → WebSSO",
-        "func_name": f"test{ctx['cap']}RedirectsWhenNotAuthenticated",
-        "body": [
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-            f"self::assertResponseStatusCodeSame({redirect_code});",
-            f"self::assertResponseRedirects('{redirect_path}');",
-        ],
-    }]
-
-
-def _scenario_auth_form(ctx, fw, _rp, _rc, _sec_roles):
-    """Formulaire : GET affiche le form, POST soumet et redirige."""
-    if not ctx["has_form"]:
-        return []
-
-    scenarios = []
-    rl  = ctx["role_label"]
-    fk  = ctx["factory_key"]
-
-    # GET → affichage
-    get_body = [
-        f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-        f"$this->client->request('GET', '{ctx['route']}');",
-        "self::assertResponseIsSuccessful();",
-    ]
-    if ctx["h1"]:
-        get_body.append(f"$this->assertSelectorTextContains('h1', '{ctx['h1']}');")
-
-    scenarios.append({
-        "comment":   f"{ctx['raw_route']} — {fk} — affichage formulaire {ctx['form_type'] or ''}",
-        "func_name": f"test{ctx['cap']}DisplaysFormWith{rl}Role",
-        "body":      get_body,
-    })
-
-    # POST → soumission
-    post_body = [
-        f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-        f"$this->client->request('POST', '{ctx['route']}');",
-    ]
-    if ctx["has_redirect"]:
-        post_body.append("self::assertResponseRedirects();")
-    else:
-        post_body.append("self::assertResponseIsSuccessful();")
-
-    scenarios.append({
-        "comment":   f"{ctx['raw_route']} — {fk} — soumission formulaire",
-        "func_name": f"test{ctx['cap']}SubmitWith{rl}Role",
-        "body":      post_body,
-    })
-
-    return scenarios
-
-
-def _scenario_auth_simple(ctx, fw, _rp, _rc, _sec_roles):
-    """Authentifié — réponse simple (pas de formulaire)."""
-    if ctx["has_form"]:
-        return []
-
-    rl = ctx["role_label"]
-    fk = ctx["factory_key"]
-
-    # Construire la requête
-    if ctx["is_ajax"]:
-        request_line = (
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}', "
-            "[], [], ['HTTP_X-Requested-With' => 'XMLHttpRequest']);"
-        )
-    else:
-        request_line = f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');"
-
-    body = [
-        f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-        request_line,
-    ]
-
-    # Assertions selon le type de réponse
-    primary = ctx["response_types"][0] if ctx["response_types"] else ""
-
-    if ctx["has_render"] and ctx["has_redirect"] and not ctx["has_form"]:
-        # Deux branches possibles (ex: edit qui peut rediriger si erreur)
-        suffix = f"IsReachedWith{rl}Role"
-        body += [
-            "$statusCode = $this->client->getResponse()->getStatusCode();",
-            "self::assertContains($statusCode, [200, 302],",
-            "    sprintf('Expected 200 or 302, got %d', $statusCode));",
-        ]
-    elif "redirect (302)" in primary:
-        suffix = f"RedirectsWith{rl}Role"
-        body.append("self::assertResponseRedirects();")
-    elif "json (200)" in primary:
-        suffix = f"ReturnsJsonWith{rl}Role"
-        body.append("self::assertResponseIsSuccessful();")
-        body.append("$this->assertJson($this->client->getResponse()->getContent());")
-    elif ctx["has_file"]:
-        suffix = f"ReturnsFileWith{rl}Role"
-        body.append("self::assertResponseIsSuccessful();")
-    elif ctx["has_export"]:
-        suffix = f"ReturnsExportWith{rl}Role"
-        body.append("self::assertResponseIsSuccessful();")
-    else:
-        suffix = f"IsReachedWith{rl}Role"
-        body.append("self::assertResponseIsSuccessful();")
-        if ctx["h1"]:
-            body.append(f"$this->assertSelectorTextContains('h1', '{ctx['h1']}');")
-        for hid in ctx["hidden_ids"][:1]:
-            body.append(f"$this->assertSelectorExists('#{hid}');")
-
-    return [{
-        "comment":   f"{ctx['raw_route']} — authentifié {fk}",
-        "func_name": f"test{ctx['cap']}{suffix}",
-        "body":      body,
-    }]
-
-
-def _scenario_ajax_no_xhr(ctx, fw, _rp, _rc, _sec_roles):
-    """Route AJAX appelée sans header XHR → 404."""
-    if not ctx["is_ajax"]:
-        return []
-    fk = ctx["factory_key"]
-    return [{
-        "comment":   f"{ctx['raw_route']} — {fk} — sans header XHR → 404",
-        "func_name": f"test{ctx['cap']}WithoutXhrReturns404",
-        "body": [
-            f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-            "self::assertResponseStatusCodeSame(404);",
-        ],
-    }]
-
-
-def _scenario_role_insufficient(ctx, fw, _rp, _rc, _sec_roles):
-    """Rôle de la classe mais pas le rôle requis par la méthode → 403."""
-    if ctx["method_role"] == ctx["class_role"]:
-        return []
-    cfk      = ctx["class_factory_key"]
-    cr_label = cfk.replace("ROLE_", "").title()
-    return [{
-        "comment":   f"{ctx['raw_route']} — {cfk} (rôle insuffisant) → 403",
-        "func_name": f"test{ctx['cap']}ForbiddenWith{cr_label}Role",
-        "body": [
-            f"$this->client->loginUser($this->getTestUser('{cfk}'), '{fw}');",
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-            "self::assertResponseStatusCodeSame(403);",
-        ],
-    }]
-
-
-def _scenario_voter(ctx, fw, _rp, _rc, _sec_roles):
-    """
-    Voter sur entité — tester l'accès refusé avec un ID inexistant.
-    Si la route n'a pas de paramètre, on teste juste l'accès courant.
-    """
-    if not ctx["has_voter"]:
-        return []
-    fk = ctx["factory_key"]
-    rl = ctx["role_label"]
-    voter_attr = ctx.get("voter_attr") or "?"
-
-    # Si la route est paramétrée, on cible une entité inexistante (99999999)
-    # → le voter ne peut pas accorder l'accès (entité=null) ou throw 404.
-    if "{" in ctx["raw_route"]:
-        bogus = re.sub(r"\{[^}]+\}", "99999999", ctx["raw_route"])
-        return [{
-            "comment":   f"{ctx['raw_route']} — voter '{voter_attr}' avec entité inexistante",
-            "func_name": f"test{ctx['cap']}VoterDeniesAccessWith{rl}Role",
-            "body": [
-                f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-                f"// Voter '{voter_attr}' attendu sur cette route — entité 99999999 inexistante.",
-                f"$this->client->request('{ctx['http_verb']}', '{bogus}');",
-                "self::assertContains(",
-                "    $this->client->getResponse()->getStatusCode(),",
-                "    [403, 404, 500],",
-                f"    \"Le voter '{voter_attr}' devrait refuser ou l'entité ne devrait pas exister\"",
-                ");",
-            ],
-        }]
-    # Pas de paramètre dans la route → on teste l'accès brut
-    return [{
-        "comment":   f"{ctx['raw_route']} — voter '{voter_attr}' — accès courant",
-        "func_name": f"test{ctx['cap']}VoterCheckWith{rl}Role",
-        "body": [
-            f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-            f"// Voter '{voter_attr}' attendu — adapter selon les fixtures",
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-            "self::assertContains(",
-            "    $this->client->getResponse()->getStatusCode(),",
-            "    [200, 302, 403],",
-            f"    \"Voter '{voter_attr}' à valider\"",
-            ");",
-        ],
-    }]
-
-
-def _scenario_not_found(ctx, fw, _rp, _rc, _sec_roles):
-    """
-    Pour les routes paramétrées ({id}, {slug}, …) : ID inexistant → 404.
-    Cas d'erreur classique que la MOA doit valider à chaque release.
-    Skippé pour les voters (déjà traité ailleurs) et les routes sans param.
-    """
-    if "{" not in ctx["raw_route"]:
-        return []
-    if ctx["has_voter"]:
-        return []
-    fk = ctx["factory_key"]
-    rl = ctx["role_label"]
-    # ID inexistant : 99999999 (peu de chances de tomber sur une vraie entité)
-    bogus_route = re.sub(r"\{[^}]+\}", "99999999", ctx["raw_route"])
-    return [{
-        "comment":   f"{ctx['raw_route']} — ressource inexistante → 404",
-        "func_name": f"test{ctx['cap']}NotFoundWith{rl}Role",
-        "body": [
-            f"$this->client->loginUser($this->getTestUser('{fk}'), '{fw}');",
-            f"$this->client->request('{ctx['http_verb']}', '{bogus_route}');",
-            "self::assertContains(",
-            "    $this->client->getResponse()->getStatusCode(),",
-            "    [404, 302, 500],",
-            "    'Une ressource inexistante doit produire 404 (ou redirect/erreur applicative)'",
-            ");",
-        ],
-    }]
-
-
-def _scenario_secondary_role(ctx, fw, _rp, _rc, sec_roles):
-    """
-    Vérifie qu'un rôle secondaire a aussi accès. Réplique les assertions
-    sémantiques (assertJson, assertSelectorTextContains) du test ADMIN pour
-    éviter une asymétrie qui ferait passer un test à tort.
-    """
-    if not sec_roles:
-        return []
-    if ctx["is_ajax"] or ctx["has_form"] or ctx["has_voter"]:
-        return []
-    if ctx["method_role"] != ctx["class_role"]:
-        return []
-
-    results = []
-    for sr in sec_roles[:1]:
-        sr_fk    = _role_to_factory_key(sr)
-        sr_label = sr_fk.replace("ROLE_", "").title()
-        body = [
-            f"$this->client->loginUser($this->getTestUser('{sr_fk}'), '{fw}');",
-            f"$this->client->request('{ctx['http_verb']}', '{ctx['route']}');",
-            "self::assertResponseIsSuccessful();",
-        ]
-        # Propage les assertions sémantiques du test principal :
-        if ctx.get("has_json"):
-            body.append("$this->assertJson($this->client->getResponse()->getContent());")
-        if ctx.get("h1"):
-            body.append(f"$this->assertSelectorTextContains('h1', '{ctx['h1']}');")
-
-        results.append({
-            "comment":   f"{ctx['raw_route']} — {sr_fk} (rôle secondaire)",
-            "func_name": f"test{ctx['cap']}IsReachedWith{sr_label}Role",
-            "body":      body,
-        })
-    return results
-
-
-# Registre des builders
-# L'ordre n'a PAS d'importance fonctionnelle (il détermine juste l'ordre
-# des tests dans le fichier PHP). Ajouter un builder ici = nouveau pattern.
-
-SCENARIO_BUILDERS = [
-    _scenario_noauth,
-    _scenario_auth_form,
-    _scenario_auth_simple,
-    _scenario_ajax_no_xhr,
-    _scenario_role_insufficient,
-    _scenario_voter,
-    _scenario_not_found,
-    _scenario_secondary_role,
-]
-
-
-# JOB STORE — suivi des tâches asynchrones (en mémoire, TTL 2h)
-# Pour un usage multi-worker, remplacer par Redis ou une DB.
-
-_jobs: Dict[str, Dict] = {}
-_jobs_lock = threading.Lock()
-_JOB_TTL_SEC = 7200  # 2 heures
-
-
-def _new_job(**meta) -> str:
-    """Crée un job, retourne son ID (12 hex chars). Purge les jobs expirés."""
-    job_id = uuid.uuid4().hex[:12]
-    now = time.time()
-    with _jobs_lock:
-        stale = [k for k, v in _jobs.items() if now - v.get("ts", 0) > _JOB_TTL_SEC]
-        for k in stale:
-            del _jobs[k]
-        _jobs[job_id] = {"status": "pending", "ts": now, "result": None, "error": None, **meta}
-    return job_id
-
-
-def _update_job(job_id: str, **kwargs) -> None:
-    with _jobs_lock:
-        if job_id in _jobs:
-            _jobs[job_id].update(kwargs)
-
-
-def _get_job(job_id: str) -> Dict:
-    with _jobs_lock:
-        return dict(_jobs.get(job_id, {}))
+from php_writer import (  # noqa: E402
+    validate_php_syntax, _safe_join, _sanitize_path_component, _write_php_file,
+)
+
+from llm_client import (  # noqa: E402
+    _load_golden_dataset, _check_ollama_alive, _call_llm, _build_prompt,
+)
+
+
+from rag_context import (  # noqa: E402
+    _build_context_str, _build_routes_summary, _validate_coverage,
+    filter_chunks_by_class,
+    RAG_LIMIT_WITH_CLASS, RAG_LIMIT_WITHOUT_CLASS,
+    TEMPLATE_LIMIT_WITH_CLASS, TEMPLATE_LIMIT_WITHOUT_CLASS,
+)
+
+
+# GÉNÉRATEUR DÉTERMINISTE + MOTEUR DE SCÉNARIOS — voir deterministic_generator.py
+# (couplage fragile avec chunk_format.py documenté là-bas)
+from deterministic_generator import (  # noqa: E402
+    _detect_controller_profile,
+    _detect_class_role,
+    _generate_php_test_from_chunks,
+    _extract_entity_types_from_chunks,
+    _generate_fixtures_skeleton,
+)
+# Génération LLM par route (anti-troncature) — voir per_route_generator.py
+from per_route_generator import generate_functional_test_per_route  # noqa: E402
+
+# JOB STORE — suivi des tâches asynchrones (voir job_store.py)
+from job_store import _new_job, _update_job, _get_job  # noqa: E402
 
 
 # ENDPOINTS — SANTÉ ET ADMINISTRATION
 
 @app.get("/health", summary="Vérification de santé", tags=["santé"])
-async def health_check(db: KnowledgeDB = Depends(get_db)):
-    """Vérifie que l'API et la base de données sont opérationnelles."""
+async def health_check(request: Request, db: KnowledgeDB = Depends(get_db)):
+    """
+    Vérifie que l'API et la base de données sont opérationnelles.
+
+    Volontairement sans authentification : la sonde du conteneur doit pouvoir
+    l'interroger. En revanche la LISTE des projets indexés — qui révèle des noms
+    d'applications internes — n'est renvoyée qu'à un appelant authentifié. Sans
+    clé, on ne donne que le compte.
+    """
     try:
         projects = db.list_projects()
-        return {
-            "status": "ok",
-            "projects_indexed": len(projects),
-            "projects": projects,
-        }
+        reponse = {"status": "ok", "projects_indexed": len(projects)}
+        attendue = settings.api_key
+        if not attendue or request.headers.get("X-API-Key") == attendue:
+            reponse["projects"] = projects
+        return reponse
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB non disponible : {e}")
 
@@ -1413,7 +354,7 @@ def learn_from_code(
                 constructor_info = ""
                 if item.get("constructor_params"):
                     params_str = ", ".join(
-                        f"{p['type'] or 'mixed'} ${p['name']}"
+                        f"{p['type'] or 'mixed'} ${p['name'] or '?'}"
                         for p in item["constructor_params"]
                     )
                     constructor_info = f" Son constructeur injecte : ({params_str})."
@@ -1425,7 +366,7 @@ def learn_from_code(
                     profile_info += f"\n  → Profil: {profile}"
                 class_grants = item.get("class_grants", [])
                 if class_grants:
-                    roles = ", ".join(g["role"] for g in class_grants)
+                    roles = ", ".join(g["role"] or "?" for g in class_grants)
                     profile_info += f"\n  → Rôles classe: {roles}"
 
                 chunks.append({
@@ -1458,7 +399,7 @@ def learn_from_code(
                         base_info += f" — {method['description']}"
                     if method.get("params"):
                         p_list = ", ".join(
-                            f"{p['type'] or '?'} ${p['name']}"
+                            f"{p['type'] or '?'} ${p['name'] or '?'}"
                             for p in method["params"]
                         )
                         base_info += f" — Params: ({p_list})"
@@ -1513,11 +454,11 @@ def learn_from_code(
                             tpl_data = template_lookup.get(renders)
                             if tpl_data:
                                 if tpl_data.get("h1"):
-                                    info += f"\n  → H1: {', '.join(tpl_data['h1'][:3])}"
+                                    info += f"\n  → H1: {', '.join(tpl_data['h1'][:MAX_METHOD_H1])}"
                                 if tpl_data.get("inputs"):
-                                    info += f"\n  → Champs formulaire: {', '.join(tpl_data['inputs'][:8])}"
+                                    info += f"\n  → Champs formulaire: {', '.join(tpl_data['inputs'][:MAX_METHOD_FIELDS])}"
                                 if tpl_data.get("hidden_ids"):
-                                    info += f"\n  → IDs cachés: {', '.join(tpl_data['hidden_ids'][:8])}"
+                                    info += f"\n  → IDs cachés: {', '.join(tpl_data['hidden_ids'][:MAX_METHOD_FIELDS])}"
 
                         for rt in response_types:
                             info += f"\n  → Type de réponse: {rt}"
@@ -1535,7 +476,7 @@ def learn_from_code(
                         if method.get("body_inferred_verb"):
                             info += f"\n  → Verbe HTTP inféré (body): {method['body_inferred_verb']}"
                         if method.get("body_reads"):
-                            info += f"\n  → Lit: {', '.join(method['body_reads'])}"
+                            info += f"\n  → Lit: {', '.join(r for r in method['body_reads'] if r)}"
 
                         # Voter checks
                         for vc in method.get("voter_checks", []):
@@ -1638,7 +579,7 @@ def generate_test(
     # RAG : recherche du contexte pertinent
     # Quand class_name est fourni, on réduit la limite RAG générique (le filtre
     # post-retrieval garde les chunks de la classe + max 3 secondaires).
-    rag_limit = 6 if data.class_name else 10
+    rag_limit = RAG_LIMIT_WITH_CLASS if data.class_name else RAG_LIMIT_WITHOUT_CLASS
     context_chunks = db.find_closest_code_context(data.project_id, query_vec, limit=rag_limit)
 
     if data.class_name:
@@ -1655,7 +596,7 @@ def generate_test(
         for c in context_chunks
     )
     if needs_templates:
-        tpl_limit = 3 if data.class_name else 5
+        tpl_limit = TEMPLATE_LIMIT_WITH_CLASS if data.class_name else TEMPLATE_LIMIT_WITHOUT_CLASS
         template_vec = brain.encode(["template twig h1 bouton lien formulaire champ"])[0]
         template_chunks = db.find_closest_code_context(data.project_id, template_vec, limit=tpl_limit)
         seen = {c["content"] for c in context_chunks}
@@ -1704,10 +645,9 @@ def generate_test(
         rel_path  = f"tests/Functional/Controller/{filename}"
         code = _generate_php_test_from_chunks(
             chunks=context_chunks,
-            class_name=data.class_name,
             test_class_name=safe_name,
         )
-        _write_php_file(rel_path, code)
+        _write_php_file(rel_path, code, overwrite=data.overwrite, allow_unsafe=data.allow_unsafe)
         logging.info(f"[generate-test] Fichier généré (déterministe) : {rel_path}")
 
         # Génère aussi un squelette de DataFixtures (TODO à compléter par la MOA)
@@ -1717,7 +657,7 @@ def generate_test(
             fixtures_code = _generate_fixtures_skeleton(entity_types, safe_name)
             fixtures_filename = f"{safe_name}Fixtures.php"
             fixtures_path = f"tests/Functional/Fixtures/{fixtures_filename}"
-            _write_php_file(fixtures_path, fixtures_code)
+            _write_php_file(fixtures_path, fixtures_code, overwrite=data.overwrite, allow_unsafe=data.allow_unsafe)
             logging.info(f"[generate-test] Fixtures squelette : {fixtures_path}")
 
         return {
@@ -1731,6 +671,70 @@ def generate_test(
             "context_used":       _build_context_str(context_chunks),
             "time_sec":           round(time.time() - start_time, 2),
             "note":               "Brouillon généré automatiquement — à relire et adapter avant exécution (fixtures, valeurs de test, cas limites).",
+        }
+
+    # Chemin LLM PAR ROUTE (défaut) — un appel Ollama par route, anti-troncature.
+    # L'ancien chemin monolithique (ci-dessous) reste atteignable via per_route=false.
+    if data.per_route:
+        safe_name = re.sub(r"[^a-zA-Z0-9]", "", data.test_name or f"{data.class_name or 'Generated'}Test")
+        filename  = f"{safe_name}.php"
+        rel_path  = f"tests/Functional/Controller/{filename}"
+        try:
+            result = generate_functional_test_per_route(
+                chunks=context_chunks,
+                class_name=data.class_name or "",
+                test_class_name=safe_name,
+            )
+        except Exception as e:
+            logging.error(f"[generate-test] Erreur génération par route : {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+        _write_php_file(rel_path, result["code"], overwrite=data.overwrite, allow_unsafe=data.allow_unsafe)
+        logging.info(
+            f"[generate-test] Par route : {result['routes_generated']}/{result['routes_total']} "
+            f"routes OK, {len(result['routes_failed'])} en échec, php_valid={result['php_valid']}"
+        )
+
+        note = "Brouillon généré automatiquement (par route) — à relire et adapter avant exécution (fixtures, valeurs de test, cas limites)."
+        if result["routes_failed"]:
+            note += (
+                f" ⚠ {len(result['routes_failed'])} route(s) en échec de génération, "
+                f"marquée(s) markTestIncomplete : {', '.join(result['routes_failed'])}."
+            )
+        if result.get("routes_skipped"):
+            note += (
+                f" ⏱ Budget de temps ({result['elapsed_sec']}s) atteint : "
+                f"{len(result['routes_skipped'])} route(s) non tentée(s) — "
+                f"{', '.join(result['routes_skipped'])}. Relancez la génération "
+                f"sur ces routes, ou utilisez deterministic=true (instantané)."
+            )
+
+        # Le statut doit refléter ce qui s'est réellement passé. Renvoyer
+        # "success" alors qu'aucune route n'a abouti — fichier entièrement
+        # composé de markTestIncomplete — laissait croire à une génération
+        # réussie. On distingue désormais trois issues.
+        if result["routes_generated"] == 0 and result["routes_total"] > 0:
+            statut = "failed"
+        elif result["routes_failed"] or result.get("routes_skipped"):
+            statut = "partial"
+        else:
+            statut = "success"
+
+        return {
+            "status":             statut,
+            "mode":               "llm_per_route",
+            "controller_profile": controller_profile,
+            "file":               filename,
+            "path":               rel_path,
+            "context_used":       _build_context_str(context_chunks),
+            "time_sec":           round(time.time() - start_time, 2),
+            "note":               note,
+            # Clés ajoutées (rétro-compatibles — Streamlit ignore les clés inconnues) :
+            "php_valid":          result["php_valid"],
+            "routes_total":       result["routes_total"],
+            "routes_generated":   result["routes_generated"],
+            "routes_failed":      result["routes_failed"],
+            "per_route":          result["per_route"],
         }
 
     context_str = _build_context_str(context_chunks)
@@ -1866,7 +870,7 @@ RÈGLES SPÉCIFIQUES (contrôleur web CRUD) :
         safe_name = re.sub(r"[^a-zA-Z0-9]", "", data.test_name or "GeneratedTest")
         filename  = f"{safe_name}.php"
         rel_path  = f"tests/Functional/Controller/{filename}"
-        _write_php_file(rel_path, code)
+        _write_php_file(rel_path, code, overwrite=data.overwrite, allow_unsafe=data.allow_unsafe)
 
         return {
             "status":             "success",
@@ -1990,7 +994,7 @@ DIRECTIVES :
                       "Controller" if "Controller" in data.file_path else "Unit"
                   )
         rel_path    = f"tests/Unit/{category}/{class_short}Test.php"
-        _write_php_file(rel_path, code)
+        _write_php_file(rel_path, code, overwrite=data.overwrite, allow_unsafe=data.allow_unsafe)
 
         return {
             "status":   "success",
@@ -2065,19 +1069,12 @@ def job_status(job_id: str):
 
 # ENDPOINT — GÉNÉRATION EN LOT (éclatement par classe)
 
-class GenerateTestsBatchRequest(BaseModel):
-    project_id: str = Field(..., min_length=1, max_length=100, pattern=_PROJECT_ID_PATTERN)
-    class_names: List[str] = Field(..., min_length=1, max_length=50)
-    deterministic: bool = True   # Défaut déterministe pour le lot (plus rapide, zéro hallucination)
-    description_prefix: str = Field(
-        default="Tests fonctionnels pour",
-        max_length=200,
-    )
-
-
 @app.post(
     "/generate-tests-batch",
-    summary="Génère des tests pour plusieurs classes en parallèle (async)",
+    # « en tâche de fond » et non « en parallèle » : BackgroundTasks exécute les
+    # classes l'une après l'autre. C'est la requête qui rend la main aussitôt,
+    # pas la génération qui se parallélise.
+    summary="Génère des tests pour plusieurs classes en tâche de fond (async)",
     tags=["génération"],
     dependencies=[Depends(require_api_key)],
 )
